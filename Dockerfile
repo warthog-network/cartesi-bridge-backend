@@ -51,13 +51,21 @@ LABEL io.cartesi.rollups.sdk_version=0.9.0
 LABEL io.cartesi.rollups.ram_size=128Mi
 
 ARG DEBIAN_FRONTEND=noninteractive
+# REQUIRED: cartesi-init is `#!/bin/busybox sh` — without busybox the machine panics (ENOENT).
 RUN <<EOF
 set -e
 apt-get update
-apt-get install -y --no-install-recommends \
-  busybox-static=1:1.30.1-7ubuntu3
+apt-get install -y --no-install-recommends busybox-static || \
+  apt-get install -y --no-install-recommends busybox-static=1:1.30.1-7ubuntu3
+# Ensure /bin/busybox exists for cartesi-init shebang
+if [ ! -x /bin/busybox ]; then
+  if [ -x /bin/busybox.static ]; then ln -sf /bin/busybox.static /bin/busybox
+  elif command -v busybox >/dev/null; then ln -sf "$(command -v busybox)" /bin/busybox
+  else echo "busybox not found after install" >&2; exit 1
+  fi
+fi
 rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/*
-useradd --create-home --user-group dapp
+id dapp >/dev/null 2>&1 || useradd --create-home --user-group dapp
 EOF
 
 ENV PATH="/opt/cartesi/bin:${PATH}"

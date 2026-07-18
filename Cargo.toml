@@ -14,9 +14,12 @@ p3-fri = { git = "https://github.com/Plonky3/Plonky3.git", rev = "7895d232" }
 anyhow = "1.0"
 hex = "0.4"
 serde = { version = "1.0", features = ["derive"] }
-sha2 = { git = "https://github.com/RustCrypto/hashes.git", branch = "master" }
-ripemd = { git = "https://github.com/RustCrypto/hashes.git", branch = "master" }
+# Pin crates.io hashes (stable for riscv64 cross + host cargo build)
+sha2 = "0.10"
+ripemd = "0.1"
+# secp256k1 for spendable vault keypairs (host recovery + optional verify)
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
 
 [[bin]]
-name = "zk-proof-generator"           # ← changed here
+name = "zk-proof-generator"
 path = "src/bin/zk-proof-generator.rs"
