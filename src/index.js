@@ -82,7 +82,7 @@ async function resolveVaultAddress({ vaultAddress, subAddress, subIndex }) {
 
 // === TOKEN ADDRESSES (local Anvil / Sepolia — override via notices in prod) ===
 // WWART is not deployed on local stack yet — deposits ignored until set to a real address.
-const WWART_ADDRESS = (process.env.WWART_ADDRESS || "0x0000000000000000000000000000000000000000").toLowerCase();
+const WWART_ADDRESS = (process.env.WWART_ADDRESS || "0x663F3ad617193148711d28f5334eE4Ed07016602").toLowerCase();
 const CTSI_ADDRESS = (process.env.CTSI_ADDRESS || "0xae7f61eCf06C65405560166b259C54031428A9C4").toLowerCase();
 const USDC_ADDRESS = (process.env.USDC_ADDRESS || "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238").toLowerCase();
 
@@ -102,6 +102,12 @@ const userMintHistories = new Map();
 const userBurnHistories = new Map();
 /** L1 owner → personal vault metadata (native token link) */
 const personalVaults = new Map();
+
+/**
+ * Per-vault collateral policy for cosigner release tickets (Phase 3).
+ * vaultAddress (wart hex) → { nextNonce, cumulativeBurnedE8, tickets: [...] }
+ */
+const vaultReleaseState = new Map();
 
 const rollupServer = process.env.ROLLUP_HTTP_SERVER_URL;
 console.log("HTTP rollup_server url:", rollupServer);
@@ -248,14 +254,24 @@ const ETH = {
   }
 };
 
-// ERC-20 transfer voucher (dApp holds tokens after portal deposit → transfer out)
+// ERC-20 vouchers:
+//  - transfer: dApp already holds tokens (portal deposit path)
+//  - mint: MinterWWART.onlyMinter — Application is msg.sender on executeVoucher,
+//    so minter must be the Cartesi Application address
 const ERC20 = {
   TRANSFER_SELECTOR: "0xa9059cbb", // transfer(address,uint256)
+  MINT_SELECTOR: "0x40c10f19", // mint(address,uint256)
 
   buildTransferPayload(recipient, amount) {
     const to = String(recipient).replace(/^0x/i, "").toLowerCase().padStart(64, "0");
     const amt = BigInt(amount).toString(16).padStart(64, "0");
     return "0x" + this.TRANSFER_SELECTOR.slice(2) + to + amt;
+  },
+
+  buildMintPayload(recipient, amount) {
+    const to = String(recipient).replace(/^0x/i, "").toLowerCase().padStart(64, "0");
+    const amt = BigInt(amount).toString(16).padStart(64, "0");
+    return "0x" + this.MINT_SELECTOR.slice(2) + to + amt;
   },
 
   async emitVoucher(tokenAddress, payload) {
@@ -273,8 +289,8 @@ const ERC20 = {
 /** Shared ERC-20 withdraw against custom userVaults map. */
 async function withdrawErc20FromVault(user, tokenKey, tokenAddress, amount, noticeType) {
   let vault = userVaults.get(user);
-  if (!vault || vault[tokenKey] < amount) {
-    console.log(`Insufficient ${tokenKey} balance`);
+  if (!vault) {
+    console.log(`Insufficient ${tokenKey} balance (no vault)`);
     return "reject";
   }
   if (!tokenAddress || tokenAddress === "0x0000000000000000000000000000000000000000") {
@@ -282,22 +298,109 @@ async function withdrawErc20FromVault(user, tokenKey, tokenAddress, amount, noti
     return "reject";
   }
 
-  vault[tokenKey] -= amount;
+  // wWART withdrawable = portable mint claims (18-dec) + real portal ERC-20 (18-dec).
+  // Legacy sweep_lock wrote spoofed E8 into vault.wWART — never treat those as withdrawable.
+  const portalWwart18 = (v) => {
+    const w = v.wWART || 0n;
+    // 1 WART portal = 1e18; spoofed E8 for 1 WART = 1e8. Values below 1e15 are E8 pollution.
+    if (w > 0n && w < 10n ** 15n) return 0n;
+    return w;
+  };
+  let available;
+  if (tokenKey === "wWART") {
+    available = (vault.wwartPortable || 0n) + portalWwart18(vault);
+  } else {
+    available = vault[tokenKey] || 0n;
+  }
+  if (available < amount) {
+    console.log(`Insufficient ${tokenKey} balance have=${available} need=${amount}`);
+    return "reject";
+  }
+
+  // Debit portable first for wWART, then base wWART (portal)
+  let portableDebit = 0n;
+  let baseDebit = 0n;
+  if (tokenKey === "wWART") {
+    const portable = vault.wwartPortable || 0n;
+    const portal = portalWwart18(vault);
+    portableDebit = portable >= amount ? amount : portable;
+    baseDebit = amount - portableDebit;
+    if (baseDebit > portal) {
+      console.log(`Insufficient portal wWART have=${portal} need=${baseDebit}`);
+      return "reject";
+    }
+    vault.wwartPortable = portable - portableDebit;
+    // Only debit real portal 18-dec balance (leave any legacy E8 pollution alone / clear it)
+    if (portal > 0n) {
+      vault.wWART = portal - baseDebit;
+    }
+    // Capacity stays locked until burn_wwart / burn_wliq.
+    // Withdraw only moves portable → L1 ERC-20 mirror; do NOT free l1WwartClaim.
+    // (Previously freeing claim on withdraw made Available == Capacity after mint+withdraw.)
+  } else {
+    vault[tokenKey] -= amount;
+  }
   userVaults.set(user, vault);
 
   try {
-    const payload = ERC20.buildTransferPayload(user, amount);
-    await ERC20.emitVoucher(tokenAddress, payload);
+    // Portable wWART claims never sat in the dApp ERC-20 balance — mint on L1 via voucher.
+    // Portal-deposited wWART (base) still transfers out of the dApp vault.
+    if (tokenKey === "wWART") {
+      if (portableDebit > 0n) {
+        await ERC20.emitVoucher(
+          tokenAddress,
+          ERC20.buildMintPayload(user, portableDebit),
+        );
+      }
+      if (baseDebit > 0n) {
+        await ERC20.emitVoucher(
+          tokenAddress,
+          ERC20.buildTransferPayload(user, baseDebit),
+        );
+      }
+    } else {
+      const payload = ERC20.buildTransferPayload(user, amount);
+      await ERC20.emitVoucher(tokenAddress, payload);
+    }
+    const newBal =
+      tokenKey === "wWART"
+        ? (
+            (vault.wwartPortable || 0n) +
+            // same portal-only rule as available (ignore legacy E8 pollution)
+            ((vault.wWART || 0n) > 0n && (vault.wWART || 0n) < 10n ** 15n
+              ? 0n
+              : vault.wWART || 0n)
+          ).toString()
+        : vault[tokenKey].toString();
     await sendNotice(stringToHex(JSON.stringify({
       type: noticeType,
       user,
       amount: amount.toString(),
-      newBalance: vault[tokenKey].toString(),
+      newBalance: newBal,
+      tokenAddress,
+      portableMinted: tokenKey === "wWART" ? portableDebit.toString() : "0",
+      portalTransferred: tokenKey === "wWART" ? baseDebit.toString() : amount.toString(),
+      // Capacity claim stays; only portable moves to L1
+      l1WwartClaim:
+        tokenKey === "wWART" ? (vault.l1WwartClaim || 0n).toString() : undefined,
+      wwartPortable:
+        tokenKey === "wWART" ? (vault.wwartPortable || 0n).toString() : undefined,
+      message:
+        tokenKey === "wWART" && portableDebit > 0n
+          ? "L1 mint voucher emitted — execute voucher so MetaMask receives wWART. Capacity stays used until burn."
+          : undefined,
     })));
     console.log(`*** ${tokenKey} WITHDRAWAL: ${amount} → ${user} ***`);
     return "accept";
   } catch (e) {
-    vault[tokenKey] += amount;
+    // rollback
+    if (tokenKey === "wWART") {
+      vault.wwartPortable = (vault.wwartPortable || 0n) + portableDebit;
+      vault.wWART = (vault.wWART || 0n) + baseDebit;
+      // l1WwartClaim was never debited on withdraw — nothing to restore for capacity
+    } else {
+      vault[tokenKey] += amount;
+    }
     userVaults.set(user, vault);
     console.error(`${tokenKey} withdraw failed:`, e.message);
     return "reject";
@@ -361,18 +464,46 @@ const handleAdvance = async (request) => {
     return "accept";
   }
 
-  // 4. ERC-20 DEPOSITS (wWART, CTSI, USDC) ─ unchanged
+  // 4. ERC-20 DEPOSITS (wWART, CTSI, USDC)
+  // Cartesi ERC20Portal payload is token(20)||depositor(20)||amount(32)||execData
+  // Some stacks prefix a 1-byte portal/version tag (observed 0x01) — detect both.
   if (sender === ERC20Portal) {
     console.log("ERC20 PORTAL INPUT RECEIVED - PAYLOAD:", request.payload);
 
     let tokenAddress = "", depositor = "", amount = 0n;
 
+    const parseErc20PortalPayload = (payload) => {
+      const hex = String(payload || "").replace(/^0x/i, "").toLowerCase();
+      const tryAt = (offsetBytes) => {
+        const o = offsetBytes * 2;
+        if (hex.length < o + 144) return null;
+        const token = "0x" + hex.slice(o, o + 40);
+        const dep = "0x" + hex.slice(o + 40, o + 80);
+        const amt = BigInt("0x" + hex.slice(o + 80, o + 144));
+        return { tokenAddress: token, depositor: dep, amount: amt };
+      };
+      const known = new Set([
+        WWART_ADDRESS.toLowerCase(),
+        CTSI_ADDRESS.toLowerCase(),
+        USDC_ADDRESS.toLowerCase(),
+      ].filter((a) => a && a !== "0x0000000000000000000000000000000000000000"));
+      const direct = tryAt(0);
+      if (direct && known.has(direct.tokenAddress)) return direct;
+      const skipped = tryAt(1);
+      if (skipped && known.has(skipped.tokenAddress)) {
+        console.log("[erc20 portal] parsed with 1-byte prefix skip");
+        return skipped;
+      }
+      // Fall back to direct even if unknown (so we can log/ignore cleanly)
+      return direct || skipped;
+    };
+
     try {
-      const data = request.payload.slice(2);
-      tokenAddress = "0x" + data.slice(0, 40).toLowerCase();
-      depositor    = "0x" + data.slice(40, 80).toLowerCase();
-      const amountHex = "0x" + data.slice(80, 144);
-      amount = BigInt(amountHex);
+      const parsed = parseErc20PortalPayload(request.payload);
+      if (!parsed) throw new Error("payload too short");
+      tokenAddress = parsed.tokenAddress;
+      depositor = parsed.depositor;
+      amount = parsed.amount;
 
       console.log("Parsed token:", tokenAddress);
       console.log("Parsed depositor:", depositor);
@@ -386,18 +517,21 @@ const handleAdvance = async (request) => {
 
     let vault = userVaults.get(depositor) || {
       liquid: 0n, wWART: 0n, CTSI: 0n, usdc: 0n, eth: 0n,
-      spoofedMinted: 0n, spoofedBurned: 0n
+      spoofedMinted: 0n, spoofedBurned: 0n, l1WwartClaim: 0n, wwartPortable: 0n,
     };
 
     let type = "unknown";
     if (tokenAddress === WWART_ADDRESS.toLowerCase()) {
-      vault.wWART += amount; type = "wwart_deposited";
+      // Portal inventory only. Capacity claim (l1WwartClaim) stays used until
+      // explicit burn_wwart — deposit does NOT free Available / Used.
+      vault.wWART = (vault.wWART || 0n) + amount;
+      type = "wwart_deposited";
     } else if (tokenAddress === CTSI_ADDRESS.toLowerCase()) {
       vault.CTSI += amount; type = "ctsi_deposited";
     } else if (tokenAddress === USDC_ADDRESS.toLowerCase()) {
       vault.usdc += amount; type = "usdc_deposited";
     } else {
-      console.log("Unknown token — ignoring");
+      console.log("Unknown token — ignoring", tokenAddress);
       return "accept";
     }
 
@@ -409,7 +543,15 @@ const handleAdvance = async (request) => {
       amount: amount.toString(),
       newBalance: type === "wwart_deposited" ? vault.wWART.toString() :
                   type === "ctsi_deposited" ? vault.CTSI.toString() :
-                  vault.usdc.toString()
+                  vault.usdc.toString(),
+      ...(type === "wwart_deposited"
+        ? {
+            l1WwartClaim: (vault.l1WwartClaim || 0n).toString(),
+            wWART: (vault.wWART || 0n).toString(),
+            message:
+              "wWART deposited to rollup balance — capacity claim still used until burn_wwart",
+          }
+        : {}),
     })));
 
     return "accept";
@@ -471,14 +613,47 @@ const handleAdvance = async (request) => {
   }
 
   // ERC-20 WITHDRAWALS — real transfer vouchers (not broken wallet.new_voucher)
+  // Amount: prefer human decimal string ("13" or "13.5"); bare huge integers treated as wei.
+  const parseTokenAmount = (raw, decimals) => {
+    const s = String(raw ?? "").trim();
+    if (!s) throw new Error("empty amount");
+    if (/^\d+$/.test(s) && s.length > 18) return BigInt(s); // already wei-scale
+    const parts = s.split(".");
+    if (parts.length > 2) throw new Error("bad amount");
+    const whole = BigInt(parts[0] || "0");
+    const frac = parts[1]
+      ? BigInt(parts[1].padEnd(decimals, "0").slice(0, decimals))
+      : 0n;
+    return whole * 10n ** BigInt(decimals) + frac;
+  };
+
   if (input?.type === "withdraw_wwart") {
-    return withdrawErc20FromVault(sender, "wWART", WWART_ADDRESS, BigInt(input.amount), "wwart_withdrawn");
+    let amt;
+    try {
+      amt = parseTokenAmount(input.amount, 18);
+    } catch (e) {
+      console.log("[withdraw_wwart] bad amount", input.amount, e.message);
+      return "reject";
+    }
+    return withdrawErc20FromVault(sender, "wWART", WWART_ADDRESS, amt, "wwart_withdrawn");
   }
   if (input?.type === "withdraw_ctsi") {
-    return withdrawErc20FromVault(sender, "CTSI", CTSI_ADDRESS, BigInt(input.amount), "ctsi_withdrawn");
+    let amt;
+    try {
+      amt = parseTokenAmount(input.amount, 18);
+    } catch {
+      return "reject";
+    }
+    return withdrawErc20FromVault(sender, "CTSI", CTSI_ADDRESS, amt, "ctsi_withdrawn");
   }
   if (input?.type === "withdraw_usdc") {
-    return withdrawErc20FromVault(sender, "usdc", USDC_ADDRESS, BigInt(input.amount), "usdc_withdrawn");
+    let amt;
+    try {
+      amt = parseTokenAmount(input.amount, 6);
+    } catch {
+      return "reject";
+    }
+    return withdrawErc20FromVault(sender, "usdc", USDC_ADDRESS, amt, "usdc_withdrawn");
   }
 
   /**
@@ -495,21 +670,42 @@ const handleAdvance = async (request) => {
     return whole * 10n ** 18n + frac;
   };
 
-  /** Convert vault backing fields into 18-dec share capacity. */
-  const backingCapacity18 = (vault) => {
-    // wWART from sweep_lock is E8 (8 decimals) → 18-dec: * 10^10
-    const fromWwartE8 = (vault.wWART || 0n) * 10n ** 10n;
-    const fromCtsi = vault.CTSI || 0n; // already 18-dec from portals
-    const fromEth = vault.eth || 0n; // wei 18-dec
-    // USDC 6-dec → 18-dec
-    const fromUsdc = (vault.usdc || 0n) * 10n ** 12n;
-    return fromWwartE8 + fromCtsi + fromEth + fromUsdc;
+  /**
+   * Share mint capacity (18-dec) from locked Warthog spoofed WART + L1 portal collateral.
+   * Does NOT include l1WwartClaim / liquid (those consume capacity).
+   * Spoofed outstanding is authoritative for "WART has been locked".
+   */
+  /** Outstanding locked WART (E8). Prefer append-only histories when present. */
+  const spoofedOutstandingE8 = (vault, userKey = null) => {
+    if (userKey) {
+      const mh = userMintHistories.get(userKey) || userMintHistories.get(String(userKey).replace(/^0x/i, "").toLowerCase()) || [];
+      const bh = userBurnHistories.get(userKey) || userBurnHistories.get(String(userKey).replace(/^0x/i, "").toLowerCase()) || [];
+      let m = mh.reduce((s, x) => s + BigInt(x.amount || 0), 0n);
+      let b = bh.reduce((s, x) => s + BigInt(x.amount || 0), 0n);
+      if (m > 0n || b > 0n) return m > b ? m - b : 0n;
+    }
+    const m = vault.spoofedMinted || 0n;
+    const b = vault.spoofedBurned || 0n;
+    return m > b ? m - b : 0n;
   };
+
+  const backingCapacity18 = (vault, userKey = null) => {
+    // Locked native WART (sweep_lock mint − burn) E8 → 18-dec
+    const fromSpoofed = spoofedOutstandingE8(vault, userKey) * 10n ** 10n;
+    const fromCtsi = vault.CTSI || 0n;
+    const fromEth = vault.eth || 0n;
+    const fromUsdc = (vault.usdc || 0n) * 10n ** 12n;
+    return fromSpoofed + fromCtsi + fromEth + fromUsdc;
+  };
+
+  /** WLIQ liquid + wWART claims share one pool. */
+  const shareClaimed18 = (vault) =>
+    (vault.liquid || 0n) + (vault.l1WwartClaim || 0n);
 
   if (input?.type === "mint_liquid" || input?.type === "mint_wliq") {
     const user = sender;
     let vault = userVaults.get(user) || {
-      liquid: 0n, wWART: 0n, CTSI: 0n, usdc: 0n, eth: 0n, spoofedMinted: 0n, spoofedBurned: 0n,
+      liquid: 0n, wWART: 0n, CTSI: 0n, usdc: 0n, eth: 0n, spoofedMinted: 0n, spoofedBurned: 0n, l1WwartClaim: 0n,
     };
 
     let requested;
@@ -524,29 +720,23 @@ const handleAdvance = async (request) => {
       return "reject";
     }
 
-    const capacity = backingCapacity18(vault);
-    const already = vault.liquid || 0n;
+    const capacity = backingCapacity18(vault, user);
+    const already = shareClaimed18(vault);
     const remaining = capacity > already ? capacity - already : 0n;
 
-    // If no backing yet, allow small demo mint only when amount ≤ 1 WLIQ
-    let mintAmt;
-    if (capacity === 0n) {
-      const demoCap = 10n ** 18n; // 1 WLIQ demo
-      mintAmt = requested > demoCap ? demoCap : requested;
-      console.log(`[mint_wliq] no backing — demo mint ${mintAmt}`);
-    } else {
-      if (remaining === 0n) {
-        console.log("[mint_wliq] capacity fully minted — rejecting");
-        return "reject";
-      }
-      mintAmt = requested > remaining ? remaining : requested;
+    // No free demo mint — need locked WART / portal backing
+    if (capacity === 0n || remaining === 0n) {
+      console.log(
+        `[mint_wliq] no capacity — capacity=${capacity} claimed=${already} remaining=${remaining}`,
+      );
+      return "reject";
     }
+    const mintAmt = requested > remaining ? remaining : requested;
 
     vault.liquid += mintAmt;
     userVaults.set(user, vault);
     await sendNotice(stringToHex(JSON.stringify({
       type: "wliq_minted",
-      // keep legacy type for older UIs
       legacyType: "liquid_minted",
       token: "WLIQ",
       user,
@@ -554,9 +744,132 @@ const handleAdvance = async (request) => {
       requested: requested.toString(),
       newBalance: vault.liquid.toString(),
       capacity: capacity.toString(),
-      remaining: (capacity > vault.liquid ? capacity - vault.liquid : 0n).toString(),
+      claimed: shareClaimed18(vault).toString(),
+      remaining: (capacity > shareClaimed18(vault) ? capacity - shareClaimed18(vault) : 0n).toString(),
+      spoofedOutstandingE8: spoofedOutstandingE8(vault, user).toString(),
     })));
     console.log(`[mint_wliq] ${user} +${mintAmt} → balance ${vault.liquid}`);
+    return "accept";
+  }
+
+  /**
+   * sync_wwart_claim — recovery / re-bind capacity after a portable L1 withdraw.
+   * Raises l1WwartClaim up to min(requested, capacity − liquid) without
+   * increasing wwartPortable (tokens already on MetaMask). Used when older
+   * withdraw code incorrectly freed claim on withdraw_wwart.
+   */
+  if (input?.type === "sync_wwart_claim" || input?.type === "repair_wwart_claim") {
+    const user = sender;
+    let vault = userVaults.get(user) || {
+      liquid: 0n, wWART: 0n, CTSI: 0n, usdc: 0n, eth: 0n, spoofedMinted: 0n, spoofedBurned: 0n, l1WwartClaim: 0n, wwartPortable: 0n,
+    };
+    let requested;
+    try {
+      requested = parseHumanTo18(input.amount, "0");
+    } catch {
+      return "reject";
+    }
+    if (requested <= 0n) return "reject";
+    const capacity = backingCapacity18(vault, user);
+    const liquid = vault.liquid || 0n;
+    const maxClaim = capacity > liquid ? capacity - liquid : 0n;
+    const target = requested > maxClaim ? maxClaim : requested;
+    const prev = vault.l1WwartClaim || 0n;
+    if (target > prev) {
+      vault.l1WwartClaim = target;
+      userVaults.set(user, vault);
+    }
+    const claimed = shareClaimed18(vault);
+    await sendNotice(stringToHex(JSON.stringify({
+      type: "wwart_claim_synced",
+      user,
+      previousClaim: prev.toString(),
+      l1WwartClaim: (vault.l1WwartClaim || 0n).toString(),
+      wwartPortable: (vault.wwartPortable || 0n).toString(),
+      capacity: capacity.toString(),
+      claimed: claimed.toString(),
+      remaining: (capacity > claimed ? capacity - claimed : 0n).toString(),
+      message: "Capacity claim re-bound (portable unchanged). Available should drop by the restored claim.",
+    })));
+    console.log(`[sync_wwart_claim] ${user} claim ${prev} → ${vault.l1WwartClaim}`);
+    return "accept";
+  }
+
+  /**
+   * mint_wwart — same capacity pool as WLIQ.
+   * Requires locked Warthog WART (spoofed outstanding > 0).
+   * WLIQ claims reduce available capacity.
+   * Credits l1WwartClaim + withdrawable wwartPortable (not capacity source).
+   */
+  if (input?.type === "mint_wwart") {
+    const user = sender;
+    if (!WWART_ADDRESS || WWART_ADDRESS === "0x0000000000000000000000000000000000000000") {
+      console.log("[mint_wwart] WWART_ADDRESS not configured");
+      return "reject";
+    }
+    // Capacity claims are bound to the live L1 token. Legacy mint_wwart inputs
+    // (no tokenAddress) or mints for a previous deploy must not re-credit claims
+    // when Anvil history is replayed after a zero-supply redeploy.
+    const reqToken = String(input.tokenAddress || "").toLowerCase();
+    if (!reqToken || reqToken !== WWART_ADDRESS) {
+      console.log(
+        `[mint_wwart] skip — tokenAddress mismatch or missing (got=${reqToken || "none"} want=${WWART_ADDRESS})`,
+      );
+      return "accept";
+    }
+    let vault = userVaults.get(user) || {
+      liquid: 0n, wWART: 0n, CTSI: 0n, usdc: 0n, eth: 0n, spoofedMinted: 0n, spoofedBurned: 0n, l1WwartClaim: 0n, wwartPortable: 0n,
+    };
+
+    let requested;
+    try {
+      requested = parseHumanTo18(input.amount, "1");
+    } catch {
+      console.log("[mint_wwart] bad amount", input.amount);
+      return "reject";
+    }
+    if (requested <= 0n) return "reject";
+
+    const lockedE8 = spoofedOutstandingE8(vault, user);
+    if (lockedE8 === 0n) {
+      console.log("[mint_wwart] reject — no locked WART (spoofed outstanding 0); lock via sweep first");
+      return "reject";
+    }
+
+    const capacity = backingCapacity18(vault, user);
+    const already = shareClaimed18(vault);
+    const remaining = capacity > already ? capacity - already : 0n;
+    if (remaining === 0n) {
+      console.log(
+        `[mint_wwart] capacity fully claimed by WLIQ/wWART — capacity=${capacity} claimed=${already}`,
+      );
+      return "reject";
+    }
+    const mintAmt = requested > remaining ? remaining : requested;
+
+    vault.l1WwartClaim = (vault.l1WwartClaim || 0n) + mintAmt;
+    // Withdrawable portable balance (18-dec) — does NOT inflate spoofed capacity
+    vault.wwartPortable = (vault.wwartPortable || 0n) + mintAmt;
+    userVaults.set(user, vault);
+
+    await sendNotice(stringToHex(JSON.stringify({
+      type: "wwart_minted",
+      token: "wWART",
+      tokenAddress: WWART_ADDRESS,
+      user,
+      amount: mintAmt.toString(),
+      requested: requested.toString(),
+      newBalance: vault.wWART.toString(),
+      l1WwartClaim: vault.l1WwartClaim.toString(),
+      wwartPortable: vault.wwartPortable.toString(),
+      capacity: capacity.toString(),
+      claimed: shareClaimed18(vault).toString(),
+      remaining: (capacity > shareClaimed18(vault) ? capacity - shareClaimed18(vault) : 0n).toString(),
+      spoofedOutstandingE8: lockedE8.toString(),
+      message:
+        "wWART claim minted against locked WART capacity (shared with WLIQ). Withdraw via withdraw_wwart / L1 mint path.",
+    })));
+    console.log(`[mint_wwart] ${user} +${mintAmt} claim; remaining capacity after=${capacity > shareClaimed18(vault) ? capacity - shareClaimed18(vault) : 0n}`);
     return "accept";
   }
 
@@ -576,6 +889,8 @@ const handleAdvance = async (request) => {
     }
     vault.liquid -= amount;
     userVaults.set(user, vault);
+    const capacity = backingCapacity18(vault, user);
+    const claimed = shareClaimed18(vault);
     await sendNotice(stringToHex(JSON.stringify({
       type: "wliq_burned",
       legacyType: "liquid_burned",
@@ -583,7 +898,78 @@ const handleAdvance = async (request) => {
       user,
       amount: amount.toString(),
       newBalance: vault.liquid.toString(),
+      capacity: capacity.toString(),
+      claimed: claimed.toString(),
+      remaining: (capacity > claimed ? capacity - claimed : 0n).toString(),
+      message: "WLIQ burned — shared mint capacity freed",
     })));
+    return "accept";
+  }
+
+  /**
+   * burn_wwart — free shared capacity by burning portable wWART claims.
+   * Reduces l1WwartClaim + wwartPortable (same pool as WLIQ).
+   * Does not burn native locked WART / spoofed outstanding.
+   */
+  if ((input?.type === "burn_wwart" || input?.type === "burn_wwart_claim") && input.amount) {
+    const user = sender;
+    let amount;
+    try {
+      amount = parseHumanTo18(input.amount, "0");
+    } catch {
+      console.log("[burn_wwart] bad amount", input.amount);
+      return "reject";
+    }
+    if (amount <= 0n) return "reject";
+    let vault = userVaults.get(user);
+    if (!vault) {
+      console.log("[burn_wwart] no vault");
+      return "reject";
+    }
+    const claim = vault.l1WwartClaim || 0n;
+    const portable = vault.wwartPortable || 0n;
+    // Portal 18-dec inventory (ignore legacy E8 pollution in wWART field)
+    const portalRaw = vault.wWART || 0n;
+    const portal = portalRaw > 0n && portalRaw < 10n ** 15n ? 0n : portalRaw;
+    // Capacity free is gated by claim only (Used). Inventory is optional debit.
+    if (claim < amount) {
+      console.log(`[burn_wwart] insufficient claim have=${claim} need=${amount}`);
+      return "reject";
+    }
+    vault.l1WwartClaim = claim - amount;
+    // Consume inventory if present (portable first, then portal deposit balance).
+    // Claim can still burn when tokens sit only on MetaMask (after withdraw).
+    let invLeft = amount;
+    if (portable > 0n && invLeft > 0n) {
+      const d = portable >= invLeft ? invLeft : portable;
+      vault.wwartPortable = portable - d;
+      invLeft -= d;
+    }
+    if (portal > 0n && invLeft > 0n) {
+      const d = portal >= invLeft ? invLeft : portal;
+      vault.wWART = portal - d;
+      invLeft -= d;
+    }
+    userVaults.set(user, vault);
+
+    const capacity = backingCapacity18(vault, user);
+    const claimed = shareClaimed18(vault);
+    await sendNotice(stringToHex(JSON.stringify({
+      type: "wwart_burned",
+      token: "wWART",
+      tokenAddress: WWART_ADDRESS,
+      user,
+      amount: amount.toString(),
+      l1WwartClaim: vault.l1WwartClaim.toString(),
+      wwartPortable: (vault.wwartPortable || 0n).toString(),
+      wWART: (vault.wWART || 0n).toString(),
+      capacity: capacity.toString(),
+      claimed: claimed.toString(),
+      remaining: (capacity > claimed ? capacity - claimed : 0n).toString(),
+      message:
+        "wWART claim burned — Used capacity freed. Deposit does not free Used; burn does. Unlock collateral is separate (Release).",
+    })));
+    console.log(`[burn_wwart] ${user} -${amount} claim remaining=${vault.l1WwartClaim}`);
     return "accept";
   }
 
@@ -774,6 +1160,47 @@ const handleAdvance = async (request) => {
       return "reject";
     }
 
+    // Solvency: capacity must stay ≥ Used (WLIQ + wWART claims) after release.
+    // Otherwise release would leave claims unbacked. User must burn claims first.
+    const ownerForCap = (subLock.owner || sender || "").toLowerCase();
+    const ownerVaultForCap = ownerForCap
+      ? userVaults.get(ownerForCap) || userVaults.get(ownerForCap.replace(/^0x/i, ""))
+      : null;
+    if (ownerVaultForCap) {
+      const used18 = shareClaimed18(ownerVaultForCap);
+      const capNow18 = backingCapacity18(ownerVaultForCap, ownerForCap);
+      // Releasing burnedAmount E8 removes that much WART-backed capacity (E8 → 18-dec).
+      const capDrop18 = burnedAmount * 10n ** 10n;
+      const capAfter18 = capNow18 > capDrop18 ? capNow18 - capDrop18 : 0n;
+      if (used18 > 0n && capAfter18 < used18) {
+        const maxFreeableE8 =
+          capNow18 > used18 ? (capNow18 - used18) / 10n ** 10n : 0n;
+        console.log(
+          `[sub_unlock] REJECT capacity would fall under Used — ` +
+            `capNow=${capNow18} used=${used18} after=${capAfter18} ` +
+            `requestedE8=${burnedAmount} maxFreeableE8=${maxFreeableE8}`,
+        );
+        await sendNotice(
+          stringToHex(
+            JSON.stringify({
+              type: "sub_unlock_rejected",
+              reason: "capacity_below_used",
+              subAddress: subNorm,
+              owner: ownerForCap,
+              burnedE8Requested: burnedAmount.toString(),
+              capacity18: capNow18.toString(),
+              used18: used18.toString(),
+              capacityAfter18: capAfter18.toString(),
+              maxFreeableE8: maxFreeableE8.toString(),
+              message:
+                "Release blocked: would leave capacity under Used. Burn wWART/WLIQ claims first, or release at most maxFreeableE8.",
+            }),
+          ),
+        );
+        return "reject";
+      }
+    }
+
     // Optional proof validation when provided (future: require Warthog burn proof)
     if (proof) {
       const tx = normalizeWarthogTx(proof);
@@ -795,27 +1222,22 @@ const handleAdvance = async (request) => {
     const vaultAddress = subLock.vaultAddress
       ? String(subLock.vaultAddress).replace(/^0x/i, "").toLowerCase()
       : null;
+    // outstanding = spoofedMinted − spoofedBurned (append-only counters).
+    // Only INCREMENT burned — never also decrement minted (that double-counted
+    // and made capacity show 76 after releasing 2 from 80).
     let vault = userVaults.get(vaultAddress);
     if (vault) {
       vault.spoofedBurned = (vault.spoofedBurned || 0n) + burnedAmount;
-      // Debit rollup-side spoofed wWART / wWART credit (collateral accounting)
-      if (vault.wWART >= burnedAmount) vault.wWART -= burnedAmount;
-      else vault.wWART = 0n;
-      if (vault.spoofedMinted >= burnedAmount) vault.spoofedMinted -= burnedAmount;
-      else vault.spoofedMinted = 0n;
+      // Collateral is spoofedMinted (E8) only — do not debit portal wWART (18-dec)
       userVaults.set(vaultAddress, vault);
     }
 
-    // Mirror debit on L1 owner vault (WalletIsland inspect)
+    // Mirror burn on L1 owner vault (WalletIsland inspect / mint capacity)
     const ownerLower = (subLock.owner || sender || "").toLowerCase();
     if (ownerLower) {
       let ownerVault = userVaults.get(ownerLower);
       if (ownerVault) {
         ownerVault.spoofedBurned = (ownerVault.spoofedBurned || 0n) + burnedAmount;
-        if (ownerVault.wWART >= burnedAmount) ownerVault.wWART -= burnedAmount;
-        else ownerVault.wWART = 0n;
-        if (ownerVault.spoofedMinted >= burnedAmount) ownerVault.spoofedMinted -= burnedAmount;
-        else ownerVault.spoofedMinted = 0n;
         userVaults.set(ownerLower, ownerVault);
       }
       const personal = personalVaults.get(ownerLower);
@@ -863,10 +1285,48 @@ const handleAdvance = async (request) => {
           : `Burned ${burnedAmount} E8 spoofed wWART; ${remainingMinted} E8 still locks the vault.`,
     })));
 
-    // Keep L1 owner mint history in sync for WalletIsland totals
-    if (ownerLower) {
-      const hist = userMintHistories.get(ownerLower) || [];
-      // Append a synthetic negative via burn history only; totals = mint sum - burn sum on inspect
+    // Phase 3: binding freeable ticket for cosigner (wart-release-ticket-v1)
+    if (vaultAddress && burnedAmount > 0n) {
+      const vKey = vaultAddress;
+      let rel = vaultReleaseState.get(vKey) || {
+        nextNonce: 1,
+        cumulativeBurnedE8: 0n,
+        tickets: [],
+      };
+      const nonce = rel.nextNonce++;
+      rel.cumulativeBurnedE8 += burnedAmount;
+      const ticketId = `${vKey.slice(0, 12)}:${nonce}`;
+      const ticket = {
+        type: "release_ticket",
+        scheme: "wart-release-ticket-v1",
+        ticketId,
+        nonce,
+        vaultAddress: vKey,
+        subAddress: subNorm,
+        owner: ownerLower || null,
+        amountE8: burnedAmount.toString(),
+        burnedE8: burnedAmount.toString(),
+        remainingMintedE8: remainingMinted.toString(),
+        cumulativeBurnedE8: rel.cumulativeBurnedE8.toString(),
+        fullyUnlocked: remainingMinted === 0n,
+        timestamp: Date.now(),
+        message:
+          "Freeable collateral ticket — compliant cosigner may release up to amountE8 of vault WART",
+      };
+      rel.tickets.push({
+        ticketId,
+        nonce,
+        amountE8: burnedAmount.toString(),
+        timestamp: ticket.timestamp,
+      });
+      // Cap in-memory ticket log
+      if (rel.tickets.length > 500) rel.tickets = rel.tickets.slice(-500);
+      vaultReleaseState.set(vKey, rel);
+
+      await sendNotice(stringToHex(JSON.stringify(ticket)));
+      console.log(
+        `[sub_unlock] release_ticket ${ticketId} amountE8=${burnedAmount} vault=${vKey.slice(0, 12)}…`,
+      );
     }
 
     console.log(
@@ -1009,11 +1469,12 @@ const handleAdvance = async (request) => {
       spoofedBurned: 0n,
     };
 
+    // Collateral is E8 on spoofedMinted only — never write E8 into wWART (18-dec portal field).
+    // Mixing units made withdraw balances / UI look doubled or show bogus "wWART" amounts.
     vault.spoofedMinted += mintedAmount;
-    vault.wWART += mintedAmount;
     userVaults.set(pendingVault, vault);
 
-    // Credit L1 owner vault so WalletIsland inspect shows bridged balance
+    // Credit L1 owner vault so WalletIsland inspect shows locked capacity
     const ownerLower = pending.owner;
     let ownerVault = userVaults.get(ownerLower) || {
       liquid: 0n,
@@ -1024,7 +1485,6 @@ const handleAdvance = async (request) => {
       spoofedMinted: 0n,
       spoofedBurned: 0n,
     };
-    ownerVault.wWART += mintedAmount;
     ownerVault.spoofedMinted += mintedAmount;
     userVaults.set(ownerLower, ownerVault);
 
@@ -1182,9 +1642,55 @@ const handleInspect = async (rawPayload) => {
     const personal =
       personalVaults.get(address) || personalVaults.get(bare) || null;
 
+    // Release-ticket summary for cosigner / UI (by personal Wart vault or owner burns)
+    let releaseSummary = null;
+    const wartVault = personal?.vaultAddress
+      ? String(personal.vaultAddress).replace(/^0x/i, "").toLowerCase()
+      : null;
+    if (wartVault && vaultReleaseState.has(wartVault)) {
+      const rel = vaultReleaseState.get(wartVault);
+      releaseSummary = {
+        vaultAddress: wartVault,
+        ticketCount: rel.tickets.length,
+        nextNonce: rel.nextNonce,
+        cumulativeBurnedE8: rel.cumulativeBurnedE8.toString(),
+        recentTickets: rel.tickets.slice(-10),
+      };
+    }
+
+    const outstandingE8 =
+      totalSpoofedMintedE8 > totalSpoofedBurnedE8
+        ? totalSpoofedMintedE8 - totalSpoofedBurnedE8
+        : 0n;
+
+    // Shared mint capacity: prefer history-based outstanding (authoritative).
+    // Fall back to vault counters only when history is empty.
+    // Do NOT use vault.minted−vault.burned when both were mutated (legacy
+    // double-count path left minted reduced AND burned increased).
+    let spoofedOut = outstandingE8;
+    if (totalSpoofedMintedE8 === 0n && totalSpoofedBurnedE8 === 0n) {
+      const m = vault.spoofedMinted || 0n;
+      const b = vault.spoofedBurned || 0n;
+      spoofedOut = m > b ? m - b : 0n;
+    }
+    const capacity18 =
+      spoofedOut * 10n ** 10n +
+      (vault.CTSI || 0n) +
+      (vault.eth || 0n) +
+      (vault.usdc || 0n) * 10n ** 12n;
+    const claimed18 = (vault.liquid || 0n) + (vault.l1WwartClaim || 0n);
+    const remaining18 = capacity18 > claimed18 ? capacity18 - claimed18 : 0n;
+
+    // Portal wWART is 18-dec. Legacy sweeps wrote spoofed E8 into wWART — hide that pollution.
+    const rawWwart = vault.wWART || 0n;
+    const portalWwartReport =
+      rawWwart > 0n && rawWwart < 10n ** 15n ? 0n : rawWwart;
+
     const reportPayload = stringToHex(JSON.stringify({
       liquid: vault.liquid.toString(),
-      wWART: vault.wWART.toString(),
+      wWART: portalWwartReport.toString(),
+      wwartPortable: (vault.wwartPortable || 0n).toString(),
+      l1WwartClaim: (vault.l1WwartClaim || 0n).toString(),
       CTSI: vault.CTSI.toString(),
       usdc: vault.usdc.toString(),
       eth: formatEther(vault.eth),
@@ -1192,6 +1698,12 @@ const handleInspect = async (rawPayload) => {
       spoofedBurnHistory: burnHistory.map(b => ({...b, amount: b.amount.toString()})),
       totalSpoofedMinted: totalSpoofedMintedE8.toString(),
       totalSpoofedBurned: totalSpoofedBurnedE8.toString(),
+      outstandingE8: outstandingE8.toString(),
+      freeableFromBurnsE8: totalSpoofedBurnedE8.toString(),
+      mintCapacity18: capacity18.toString(),
+      mintClaimed18: claimed18.toString(),
+      mintRemaining18: remaining18.toString(),
+      releaseTickets: releaseSummary,
       personalVault: personal ? {
         vaultAddress: personal.vaultAddress,
         subAddress: personal.subAddress,
