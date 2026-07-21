@@ -907,8 +907,16 @@ const handleAdvance = async (request) => {
   }
 
   /**
-   * burn_wwart — free shared capacity by burning portable wWART claims.
-   * Reduces l1WwartClaim + wwartPortable (same pool as WLIQ).
+   * burn_wwart — free shared capacity by burning wWART claims.
+   *
+   * Open vs filled (must not free capacity while ERC-20 sits only on MetaMask):
+   *   openClaim   = wwartPortable          (not yet withdrawn to L1)
+   *   filledClaim = l1WwartClaim − portable (already voucher-minted to MetaMask)
+   *   burnable    = min(claim, portable + portalInventory)
+   *
+   * Open claims can be burned immediately (cancel unused claim).
+   * Filled claims require depositing L1 wWART back first (portal inventory),
+   * then burn_wwart debits portal 1:1 with claim free.
    * Does not burn native locked WART / spoofed outstanding.
    */
   if ((input?.type === "burn_wwart" || input?.type === "burn_wwart_claim") && input.amount) {
@@ -931,14 +939,43 @@ const handleAdvance = async (request) => {
     // Portal 18-dec inventory (ignore legacy E8 pollution in wWART field)
     const portalRaw = vault.wWART || 0n;
     const portal = portalRaw > 0n && portalRaw < 10n ** 15n ? 0n : portalRaw;
-    // Capacity free is gated by claim only (Used). Inventory is optional debit.
+    const openClaim = portable < claim ? portable : claim;
+    const filledClaim = claim > openClaim ? claim - openClaim : 0n;
+    // Cover for capacity free: open portable + returned L1 inventory only
+    const coverable = portable + portal;
+    const burnable = claim < coverable ? claim : coverable;
+
     if (claim < amount) {
       console.log(`[burn_wwart] insufficient claim have=${claim} need=${amount}`);
       return "reject";
     }
+    if (amount > burnable) {
+      console.log(
+        `[burn_wwart] reject — filled on L1 without return: amount=${amount} burnable=${burnable} open=${openClaim} filled=${filledClaim} portal=${portal}`,
+      );
+      await sendNotice(
+        stringToHex(
+          JSON.stringify({
+            type: "wwart_burn_rejected",
+            token: "wWART",
+            user,
+            amount: amount.toString(),
+            l1WwartClaim: claim.toString(),
+            wwartPortable: portable.toString(),
+            wwartOpenClaim: openClaim.toString(),
+            wwartFilledClaim: filledClaim.toString(),
+            wwartPortal: portal.toString(),
+            wwartBurnable: burnable.toString(),
+            message:
+              "Cannot free filled wWART claims while ERC-20 is still on MetaMask. Deposit L1 wWART back to the rollup first, then burn claims. Open (unfilled) portable can burn without deposit.",
+          }),
+        ),
+      );
+      return "reject";
+    }
+
     vault.l1WwartClaim = claim - amount;
-    // Consume inventory if present (portable first, then portal deposit balance).
-    // Claim can still burn when tokens sit only on MetaMask (after withdraw).
+    // Debit inventory 1:1 with claim free (portable first, then portal deposit).
     let invLeft = amount;
     if (portable > 0n && invLeft > 0n) {
       const d = portable >= invLeft ? invLeft : portable;
@@ -949,6 +986,14 @@ const handleAdvance = async (request) => {
       const d = portal >= invLeft ? invLeft : portal;
       vault.wWART = portal - d;
       invLeft -= d;
+    }
+    if (invLeft > 0n) {
+      // Should be unreachable given burnable gate — fail closed
+      console.log(`[burn_wwart] invariant fail invLeft=${invLeft}`);
+      vault.l1WwartClaim = claim;
+      vault.wwartPortable = portable;
+      vault.wWART = portalRaw;
+      return "reject";
     }
     userVaults.set(user, vault);
 
@@ -967,7 +1012,7 @@ const handleAdvance = async (request) => {
       claimed: claimed.toString(),
       remaining: (capacity > claimed ? capacity - claimed : 0n).toString(),
       message:
-        "wWART claim burned — Used capacity freed. Deposit does not free Used; burn does. Unlock collateral is separate (Release).",
+        "wWART claim burned against open portable and/or returned portal inventory — Used capacity freed. Filled MetaMask wWART must be deposited before it can free capacity.",
     })));
     console.log(`[burn_wwart] ${user} -${amount} claim remaining=${vault.l1WwartClaim}`);
     return "accept";
@@ -1686,11 +1731,24 @@ const handleInspect = async (rawPayload) => {
     const portalWwartReport =
       rawWwart > 0n && rawWwart < 10n ** 15n ? 0n : rawWwart;
 
+    // Open = still portable (not withdrawn); filled = claim held while ERC-20 is on L1.
+    // Burnable capacity free = min(claim, portable + portal returned inventory).
+    const claimR = vault.l1WwartClaim || 0n;
+    const portableR = vault.wwartPortable || 0n;
+    const openClaimR = portableR < claimR ? portableR : claimR;
+    const filledClaimR = claimR > openClaimR ? claimR - openClaimR : 0n;
+    const coverableR = portableR + portalWwartReport;
+    const burnableR = claimR < coverableR ? claimR : coverableR;
+
     const reportPayload = stringToHex(JSON.stringify({
       liquid: vault.liquid.toString(),
       wWART: portalWwartReport.toString(),
       wwartPortable: (vault.wwartPortable || 0n).toString(),
       l1WwartClaim: (vault.l1WwartClaim || 0n).toString(),
+      // Explicit open / filled / burnable for UI (filled must deposit L1 before burn frees Used)
+      wwartOpenClaim: openClaimR.toString(),
+      wwartFilledClaim: filledClaimR.toString(),
+      wwartBurnable: burnableR.toString(),
       CTSI: vault.CTSI.toString(),
       usdc: vault.usdc.toString(),
       eth: formatEther(vault.eth),
