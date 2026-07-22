@@ -104,10 +104,76 @@ const userBurnHistories = new Map();
 const personalVaults = new Map();
 
 /**
+ * ETH bridge sub-wallets (first step ETH → WART).
+ * ethSubByAddress: ethAddress(lower) → { owner, index, address }
+ * ethSubsByOwner:  owner(lower) → Map(index → { address, ethWei })
+ * Portal ETH deposited from a registered sub credits owner vault.eth + sub ethWei.
+ * Does NOT affect WART mint capacity.
+ */
+const ethSubByAddress = new Map();
+const ethSubsByOwner = new Map();
+
+/**
+ * Cosigner ETH vaults (eth-2p-ecdsa-lindell-v1).
+ * ethVaultByAddress: vaultEth → metadata
+ * ethVaultsByOwner: owner → list of vault records
+ * Locked ETH capacity is SEPARATE from WART mint capacity.
+ * wETH claims (rollup) are temporary until Warthog DeFi WETH exists.
+ */
+const ethVaultByAddress = new Map();
+const ethVaultsByOwner = new Map();
+/** eth vault → release tickets for future cosign ETH withdraw */
+const ethVaultReleaseState = new Map();
+
+/**
  * Per-vault collateral policy for cosigner release tickets (Phase 3).
  * vaultAddress (wart hex) → { nextNonce, cumulativeBurnedE8, tickets: [...] }
  */
 const vaultReleaseState = new Map();
+
+function ensureUserVaultShell(user) {
+  const u = String(user || "").toLowerCase();
+  let v = userVaults.get(u);
+  if (!v) {
+    v = {
+      liquid: 0n,
+      wWART: 0n,
+      CTSI: 0n,
+      usdc: 0n,
+      eth: 0n,
+      spoofedMinted: 0n,
+      spoofedBurned: 0n,
+      l1WwartClaim: 0n,
+      wwartPortable: 0n,
+      ethLockedMinted: 0n,
+      ethLockedBurned: 0n,
+      l1WethClaim: 0n,
+      wethPortable: 0n,
+    };
+    userVaults.set(u, v);
+  } else {
+    if (v.ethLockedMinted == null) v.ethLockedMinted = 0n;
+    if (v.ethLockedBurned == null) v.ethLockedBurned = 0n;
+    if (v.l1WethClaim == null) v.l1WethClaim = 0n;
+    if (v.wethPortable == null) v.wethPortable = 0n;
+  }
+  return v;
+}
+
+/** Locked ETH outstanding (wei) → capacity for wETH claims only. */
+function ethLockedOutstandingWei(vault) {
+  const m = vault?.ethLockedMinted || 0n;
+  const b = vault?.ethLockedBurned || 0n;
+  return m > b ? m - b : 0n;
+}
+
+function ethBackingCapacity18(vault) {
+  return ethLockedOutstandingWei(vault);
+}
+
+function ethShareClaimed18(vault) {
+  return vault?.l1WethClaim || 0n;
+}
 
 const rollupServer = process.env.ROLLUP_HTTP_SERVER_URL;
 console.log("HTTP rollup_server url:", rollupServer);
@@ -200,27 +266,73 @@ const ETH = {
     }
   },
 
+  /**
+   * Credit ETH inventory. If depositor is a registered eth sub-wallet,
+   * attribute to the L1 owner vault + that sub index (not mint capacity).
+   */
   creditToVault(vaults, depositor, amountWei) {
-    let vault = vaults.get(depositor) || {
+    const dep = String(depositor || "").toLowerCase();
+    const sub = ethSubByAddress.get(dep);
+    const creditUser = sub?.owner || dep;
+
+    let vault = vaults.get(creditUser) || {
       liquid: 0n,
       wWART: 0n,
       CTSI: 0n,
       usdc: 0n,
       eth: 0n,
       spoofedMinted: 0n,
-      spoofedBurned: 0n
+      spoofedBurned: 0n,
+      l1WwartClaim: 0n,
+      wwartPortable: 0n,
     };
-    vault.eth += amountWei;
-    vaults.set(depositor, vault);
+    vault.eth = (vault.eth || 0n) + amountWei;
+    vaults.set(creditUser, vault);
+
+    let subIndex = null;
+    let subBalance = null;
+    if (sub) {
+      let byIdx = ethSubsByOwner.get(sub.owner);
+      if (!byIdx) {
+        byIdx = new Map();
+        ethSubsByOwner.set(sub.owner, byIdx);
+      }
+      const cur = byIdx.get(sub.index) || {
+        address: sub.address,
+        ethWei: 0n,
+      };
+      cur.ethWei = (cur.ethWei || 0n) + amountWei;
+      cur.address = sub.address;
+      byIdx.set(sub.index, cur);
+      subIndex = sub.index;
+      subBalance = cur.ethWei.toString();
+    }
+
+    return {
+      creditUser,
+      subIndex,
+      subBalance,
+      newBalance: vault.eth.toString(),
+    };
   },
 
-  createDepositNotice(depositor, amountWei) {
-    const vault = userVaults.get(depositor);
+  createDepositNotice(depositor, amountWei, creditMeta = null) {
+    const meta = creditMeta || {};
+    const user = meta.creditUser || depositor;
+    const vault = userVaults.get(user);
     return {
       type: "eth_deposited",
-      user: depositor,
+      user,
+      depositor,
       amount: amountWei.toString(),
-      newBalance: vault?.eth.toString() ?? "0"
+      newBalance: meta.newBalance ?? vault?.eth?.toString() ?? "0",
+      /** null unless depositor is a registered eth sub */
+      ethSubIndex: meta.subIndex != null ? meta.subIndex : null,
+      ethSubBalance: meta.subBalance != null ? meta.subBalance : null,
+      message:
+        meta.subIndex != null
+          ? `ETH portal → owner via eth sub #${meta.subIndex} (inventory only, not WART mint capacity)`
+          : "ETH portal inventory (not WART mint capacity)",
     };
   },
 
@@ -454,6 +566,464 @@ const handleAdvance = async (request) => {
     return "accept";
   }
 
+  /**
+   * register_eth_sub — bind an HD ETH deposit address (indexed) to this L1 owner.
+   * First step of ETH → WART bridge: deposit addresses with index like WART subs.
+   * Portal ETH from that address credits owner inventory (not WART mint capacity).
+   *
+   * input: { type, index, ethAddress, path? }
+   */
+  if (input?.type === "register_eth_sub" || input?.type === "eth_sub_register") {
+    const owner = String(sender || "").toLowerCase();
+    const index = Number(input.index);
+    const ethAddress = String(input.ethAddress || input.address || "")
+      .toLowerCase();
+    if (!Number.isFinite(index) || index < 0 || index >= 0x80000000) {
+      console.log("[register_eth_sub] bad index", input.index);
+      return "reject";
+    }
+    if (!/^0x[0-9a-f]{40}$/.test(ethAddress)) {
+      console.log("[register_eth_sub] bad ethAddress", input.ethAddress);
+      return "reject";
+    }
+    const existing = ethSubByAddress.get(ethAddress);
+    if (existing && existing.owner !== owner) {
+      console.log(
+        "[register_eth_sub] address already bound to another owner",
+        ethAddress,
+        existing.owner,
+      );
+      return "reject";
+    }
+    // Same owner re-register same index → update address if needed
+    let byIdx = ethSubsByOwner.get(owner);
+    if (!byIdx) {
+      byIdx = new Map();
+      ethSubsByOwner.set(owner, byIdx);
+    }
+    const prevAtIndex = byIdx.get(index);
+    if (prevAtIndex && prevAtIndex.address !== ethAddress) {
+      ethSubByAddress.delete(prevAtIndex.address);
+    }
+    const prevWei = prevAtIndex?.ethWei || 0n;
+    const entry = {
+      address: ethAddress,
+      ethWei: prevWei,
+      path: input.path ? String(input.path) : null,
+    };
+    byIdx.set(index, entry);
+    ethSubByAddress.set(ethAddress, { owner, index, address: ethAddress });
+
+    // Ensure owner vault exists (inventory shell; capacity stays 0 until WART lock)
+    if (!userVaults.has(owner)) {
+      userVaults.set(owner, {
+        liquid: 0n,
+        wWART: 0n,
+        CTSI: 0n,
+        usdc: 0n,
+        eth: 0n,
+        spoofedMinted: 0n,
+        spoofedBurned: 0n,
+        l1WwartClaim: 0n,
+        wwartPortable: 0n,
+      });
+    }
+    registeredUsers.set(owner, true);
+
+    await sendNotice(
+      stringToHex(
+        JSON.stringify({
+          type: "eth_sub_registered",
+          user: owner,
+          index,
+          ethAddress,
+          path: entry.path,
+          ethWei: entry.ethWei.toString(),
+          message:
+            "ETH sub-wallet registered — fund this address, then portal-deposit; inventory only (not WART mint capacity)",
+        }),
+      ),
+    );
+    console.log(
+      `[register_eth_sub] owner=${owner} index=${index} eth=${ethAddress}`,
+    );
+    return "accept";
+  }
+
+  /**
+   * create_eth_vault — register a cosigner 2P ETH vault under this L1 owner.
+   * input: { type, vaultAddress, ethSubAddress?, index?, scheme? }
+   */
+  if (input?.type === "create_eth_vault" || input?.type === "eth_vault_create") {
+    const owner = String(sender || "").toLowerCase();
+    const vaultAddress = String(input.vaultAddress || input.address || "")
+      .toLowerCase();
+    const ethSubAddress = input.ethSubAddress
+      ? String(input.ethSubAddress).toLowerCase()
+      : input.subAddress
+        ? String(input.subAddress).toLowerCase()
+        : null;
+    const index =
+      input.index != null && input.index !== ""
+        ? Number(input.index)
+        : null;
+    if (!/^0x[0-9a-f]{40}$/.test(vaultAddress)) {
+      console.log("[create_eth_vault] bad vaultAddress", input.vaultAddress);
+      return "reject";
+    }
+    const existing = ethVaultByAddress.get(vaultAddress);
+    if (existing && existing.owner !== owner) {
+      console.log("[create_eth_vault] vault owned by another", vaultAddress);
+      return "reject";
+    }
+    const rec = {
+      vaultAddress,
+      owner,
+      ethSubAddress,
+      index: Number.isFinite(index) ? index : null,
+      scheme: input.scheme || "eth-2p-ecdsa-lindell-v1",
+      lockedMinted: existing?.lockedMinted || 0n,
+      lockedBurned: existing?.lockedBurned || 0n,
+      createdAt: existing?.createdAt || Date.now(),
+    };
+    ethVaultByAddress.set(vaultAddress, rec);
+    let list = ethVaultsByOwner.get(owner);
+    if (!list) {
+      list = [];
+      ethVaultsByOwner.set(owner, list);
+    }
+    const i = list.findIndex((x) => x.vaultAddress === vaultAddress);
+    if (i >= 0) list[i] = rec;
+    else list.push(rec);
+
+    ensureUserVaultShell(owner);
+    registeredUsers.set(owner, true);
+
+    await sendNotice(
+      stringToHex(
+        JSON.stringify({
+          type: "eth_vault_created",
+          user: owner,
+          vaultAddress,
+          ethSubAddress,
+          index: rec.index,
+          scheme: rec.scheme,
+          message:
+            "Cosigner ETH vault registered — fund vault, lock for ETH capacity, mint wETH claims (not WART capacity)",
+        }),
+      ),
+    );
+    console.log(
+      `[create_eth_vault] owner=${owner} vault=${vaultAddress} index=${rec.index}`,
+    );
+    return "accept";
+  }
+
+  /**
+   * eth_vault_lock — lock native ETH as ETH-side mint capacity (owner attestation for now).
+   * Funds should already sit on the cosigner vault address on L1.
+   * input: { type, vaultAddress, amount | amountWei }
+   */
+  if (input?.type === "eth_vault_lock" || input?.type === "lock_eth_vault") {
+    const owner = String(sender || "").toLowerCase();
+    const vaultAddress = String(input.vaultAddress || "").toLowerCase();
+    const rec = ethVaultByAddress.get(vaultAddress);
+    if (!rec || rec.owner !== owner) {
+      console.log("[eth_vault_lock] unknown vault or not owner", vaultAddress);
+      return "reject";
+    }
+    let amountWei = 0n;
+    try {
+      if (input.amountWei != null) amountWei = BigInt(String(input.amountWei));
+      else if (input.amount != null) {
+        // human ETH → wei
+        const s = String(input.amount).trim();
+        if (s.includes(".")) {
+          const [w, f = ""] = s.split(".");
+          const frac = (f + "000000000000000000").slice(0, 18);
+          amountWei = BigInt(w || "0") * 10n ** 18n + BigInt(frac || "0");
+        } else {
+          amountWei = BigInt(s) * 10n ** 18n;
+        }
+      }
+    } catch (e) {
+      console.log("[eth_vault_lock] bad amount", e?.message);
+      return "reject";
+    }
+    if (amountWei <= 0n) {
+      console.log("[eth_vault_lock] non-positive");
+      return "reject";
+    }
+
+    const vault = ensureUserVaultShell(owner);
+    vault.ethLockedMinted = (vault.ethLockedMinted || 0n) + amountWei;
+    rec.lockedMinted = (rec.lockedMinted || 0n) + amountWei;
+    ethVaultByAddress.set(vaultAddress, rec);
+    userVaults.set(owner, vault);
+
+    const outstanding = ethLockedOutstandingWei(vault);
+    const claimed = ethShareClaimed18(vault);
+    await sendNotice(
+      stringToHex(
+        JSON.stringify({
+          type: "eth_vault_locked",
+          user: owner,
+          vaultAddress,
+          amountWei: amountWei.toString(),
+          amount: formatEther(amountWei),
+          ethLockedOutstanding: outstanding.toString(),
+          ethCapacity18: outstanding.toString(),
+          ethClaimed18: claimed.toString(),
+          ethRemaining18: (outstanding > claimed
+            ? outstanding - claimed
+            : 0n
+          ).toString(),
+          message:
+            "ETH locked as capacity (separate from WART). Mint wETH claims against this pool.",
+        }),
+      ),
+    );
+    console.log(
+      `[eth_vault_lock] ${owner} +${formatEther(amountWei)} ETH capacity vault=${vaultAddress}`,
+    );
+    return "accept";
+  }
+
+  /**
+   * eth_vault_unlock / release_eth — free locked ETH capacity (must leave claim covered).
+   * Emits eth_release_ticket for future cosigner ETH withdraw policy.
+   */
+  if (
+    input?.type === "eth_vault_unlock" ||
+    input?.type === "release_eth" ||
+    input?.type === "unlock_eth_vault"
+  ) {
+    const owner = String(sender || "").toLowerCase();
+    const vaultAddress = String(input.vaultAddress || "").toLowerCase();
+    const rec = ethVaultByAddress.get(vaultAddress);
+    if (!rec || rec.owner !== owner) {
+      console.log("[eth_vault_unlock] unknown vault", vaultAddress);
+      return "reject";
+    }
+    let amountWei = 0n;
+    try {
+      if (input.amountWei != null) amountWei = BigInt(String(input.amountWei));
+      else if (input.amount != null) {
+        const s = String(input.amount).trim();
+        if (s.includes(".")) {
+          const [w, f = ""] = s.split(".");
+          const frac = (f + "000000000000000000").slice(0, 18);
+          amountWei = BigInt(w || "0") * 10n ** 18n + BigInt(frac || "0");
+        } else {
+          amountWei = BigInt(s) * 10n ** 18n;
+        }
+      }
+    } catch {
+      return "reject";
+    }
+    if (amountWei <= 0n) return "reject";
+
+    const vault = ensureUserVaultShell(owner);
+    const outstanding = ethLockedOutstandingWei(vault);
+    const claimed = ethShareClaimed18(vault);
+    // After unlock, capacity must still cover used wETH claims
+    if (outstanding < amountWei) {
+      console.log("[eth_vault_unlock] amount > outstanding");
+      return "reject";
+    }
+    const after = outstanding - amountWei;
+    if (after < claimed) {
+      console.log(
+        `[eth_vault_unlock] would leave capacity ${after} < used ${claimed} — burn wETH claims first`,
+      );
+      await sendNotice(
+        stringToHex(
+          JSON.stringify({
+            type: "eth_vault_unlock_rejected",
+            user: owner,
+            vaultAddress,
+            amountWei: amountWei.toString(),
+            outstanding: outstanding.toString(),
+            claimed: claimed.toString(),
+            maxFreeableWei: (outstanding > claimed
+              ? outstanding - claimed
+              : 0n
+            ).toString(),
+            message: "Burn wETH claims first — Capacity would fall under Used",
+          }),
+        ),
+      );
+      return "reject";
+    }
+
+    vault.ethLockedBurned = (vault.ethLockedBurned || 0n) + amountWei;
+    rec.lockedBurned = (rec.lockedBurned || 0n) + amountWei;
+    ethVaultByAddress.set(vaultAddress, rec);
+    userVaults.set(owner, vault);
+
+    // Release ticket for cosigner (future ETH vault → main)
+    let rel = ethVaultReleaseState.get(vaultAddress);
+    if (!rel) {
+      rel = { nextNonce: 1, cumulativeBurnedWei: 0n, tickets: [] };
+      ethVaultReleaseState.set(vaultAddress, rel);
+    }
+    const nonce = rel.nextNonce++;
+    rel.cumulativeBurnedWei += amountWei;
+    const ticket = {
+      type: "eth_release_ticket",
+      scheme: "eth-release-ticket-v1",
+      ticketId: `${vaultAddress.slice(2, 14)}:${nonce}`,
+      nonce,
+      vaultAddress,
+      owner,
+      amountWei: amountWei.toString(),
+      remainingLockedWei: after.toString(),
+      cumulativeBurnedWei: rel.cumulativeBurnedWei.toString(),
+      timestamp: Date.now(),
+      message: "Freeable ETH collateral ticket — cosigner may release up to amountWei (later)",
+    };
+    rel.tickets.push(ticket);
+
+    await sendNotice(stringToHex(JSON.stringify({
+      type: "eth_vault_unlocked",
+      user: owner,
+      vaultAddress,
+      amountWei: amountWei.toString(),
+      amount: formatEther(amountWei),
+      ethLockedOutstanding: after.toString(),
+      ethCapacity18: after.toString(),
+      ethClaimed18: claimed.toString(),
+      ethRemaining18: (after > claimed ? after - claimed : 0n).toString(),
+    })));
+    await sendNotice(stringToHex(JSON.stringify(ticket)));
+    console.log(
+      `[eth_vault_unlock] ${owner} -${formatEther(amountWei)} ETH capacity vault=${vaultAddress}`,
+    );
+    return "accept";
+  }
+
+  /**
+   * mint_weth_claim — mint rollup wETH claim against locked ETH capacity only.
+   * Not WART capacity. Temporary until Warthog DeFi WETH / L1 WETH voucher path.
+   */
+  if (input?.type === "mint_weth_claim" || input?.type === "mint_weth") {
+    const user = String(sender || "").toLowerCase();
+    const vault = ensureUserVaultShell(user);
+    let requested = 0n;
+    try {
+      if (input.amountWei != null) requested = BigInt(String(input.amountWei));
+      else {
+        const s = String(input.amount || "0").trim();
+        if (s.includes(".")) {
+          const [w, f = ""] = s.split(".");
+          const frac = (f + "000000000000000000").slice(0, 18);
+          requested = BigInt(w || "0") * 10n ** 18n + BigInt(frac || "0");
+        } else {
+          requested = BigInt(s || "0") * 10n ** 18n;
+        }
+      }
+    } catch {
+      return "reject";
+    }
+    if (requested <= 0n) return "reject";
+
+    const capacity = ethBackingCapacity18(vault);
+    const already = ethShareClaimed18(vault);
+    const remaining = capacity > already ? capacity - already : 0n;
+    if (capacity === 0n || remaining === 0n) {
+      console.log(
+        `[mint_weth_claim] no ETH capacity capacity=${capacity} claimed=${already}`,
+      );
+      return "reject";
+    }
+    const mintAmt = requested > remaining ? remaining : requested;
+    vault.l1WethClaim = (vault.l1WethClaim || 0n) + mintAmt;
+    vault.wethPortable = (vault.wethPortable || 0n) + mintAmt;
+    userVaults.set(user, vault);
+
+    await sendNotice(
+      stringToHex(
+        JSON.stringify({
+          type: "weth_claim_minted",
+          token: "wETH",
+          user,
+          amount: mintAmt.toString(),
+          l1WethClaim: vault.l1WethClaim.toString(),
+          wethPortable: vault.wethPortable.toString(),
+          ethCapacity18: capacity.toString(),
+          ethClaimed18: ethShareClaimed18(vault).toString(),
+          ethRemaining18: (
+            capacity > ethShareClaimed18(vault)
+              ? capacity - ethShareClaimed18(vault)
+              : 0n
+          ).toString(),
+          message:
+            "wETH claim minted against locked ETH (rollup claim only — L1 WETH when DeFi path exists)",
+        }),
+      ),
+    );
+    console.log(`[mint_weth_claim] ${user} +${formatEther(mintAmt)} wETH claim`);
+    return "accept";
+  }
+
+  /**
+   * burn_weth_claim — free ETH capacity Used (does not unlock vault collateral).
+   */
+  if (input?.type === "burn_weth_claim" || input?.type === "burn_weth") {
+    const user = String(sender || "").toLowerCase();
+    const vault = ensureUserVaultShell(user);
+    let amount = 0n;
+    try {
+      if (input.amountWei != null) amount = BigInt(String(input.amountWei));
+      else {
+        const s = String(input.amount || "0").trim();
+        if (s.includes(".")) {
+          const [w, f = ""] = s.split(".");
+          const frac = (f + "000000000000000000").slice(0, 18);
+          amount = BigInt(w || "0") * 10n ** 18n + BigInt(frac || "0");
+        } else {
+          amount = BigInt(s || "0") * 10n ** 18n;
+        }
+      }
+    } catch {
+      return "reject";
+    }
+    if (amount <= 0n) return "reject";
+
+    const claim = vault.l1WethClaim || 0n;
+    const portable = vault.wethPortable || 0n;
+    // Burn prefers portable cover; allow burn up to claim if portable covers
+    const burnable = claim < portable ? claim : portable;
+    if (burnable <= 0n) {
+      console.log("[burn_weth_claim] nothing burnable");
+      return "reject";
+    }
+    const burnAmt = amount > burnable ? burnable : amount;
+    vault.l1WethClaim = claim - burnAmt;
+    vault.wethPortable = portable > burnAmt ? portable - burnAmt : 0n;
+    userVaults.set(user, vault);
+
+    const capacity = ethBackingCapacity18(vault);
+    const claimed = ethShareClaimed18(vault);
+    await sendNotice(
+      stringToHex(
+        JSON.stringify({
+          type: "weth_claim_burned",
+          user,
+          amount: burnAmt.toString(),
+          l1WethClaim: vault.l1WethClaim.toString(),
+          wethPortable: vault.wethPortable.toString(),
+          ethCapacity18: capacity.toString(),
+          ethClaimed18: claimed.toString(),
+          ethRemaining18: (capacity > claimed ? capacity - claimed : 0n).toString(),
+          message: "wETH claim burned — ETH capacity Available ↑; release vault lock separately",
+        }),
+      ),
+    );
+    console.log(`[burn_weth_claim] ${user} -${formatEther(burnAmt)} wETH claim`);
+    return "accept";
+  }
+
   // 3. ETH DEPOSITS ─ using ETH module
   if (sender === ETH.PORTAL_ADDRESS) {
     console.log("ETH PORTAL INPUT RECEIVED - PAYLOAD:", request.payload);
@@ -466,14 +1036,20 @@ const handleAdvance = async (request) => {
 
     const { depositor, amountWei } = parsed;
 
-    console.log(`Crediting ${formatEther(amountWei)} ETH to ${depositor}`);
+    const creditMeta = ETH.creditToVault(userVaults, depositor, amountWei);
+    console.log(
+      `Crediting ${formatEther(amountWei)} ETH → ${creditMeta.creditUser}` +
+        (creditMeta.subIndex != null
+          ? ` (via eth sub #${creditMeta.subIndex}, depositor ${depositor})`
+          : ` (depositor ${depositor})`),
+    );
 
-    ETH.creditToVault(userVaults, depositor, amountWei);
-
-    const noticePayload = ETH.createDepositNotice(depositor, amountWei);
+    const noticePayload = ETH.createDepositNotice(depositor, amountWei, creditMeta);
     await sendNotice(stringToHex(JSON.stringify(noticePayload)));
 
-    console.log(`*** ETH DEPOSIT CREDITED: ${formatEther(amountWei)} ETH → ${depositor} ***`);
+    console.log(
+      `*** ETH DEPOSIT CREDITED: ${formatEther(amountWei)} ETH → ${creditMeta.creditUser} ***`,
+    );
 
     return "accept";
   }
@@ -703,16 +1279,15 @@ const handleAdvance = async (request) => {
     return m > b ? m - b : 0n;
   };
 
+  /**
+   * Mint capacity for WLIQ + wWART claims = locked native WART only.
+   * Portal ETH / CTSI / USDC are separate balances (not fungible mint headroom).
+   */
   const backingCapacity18 = (vault, userKey = null) => {
-    // Locked native WART (sweep_lock mint − burn) E8 → 18-dec
-    const fromSpoofed = spoofedOutstandingE8(vault, userKey) * 10n ** 10n;
-    const fromCtsi = vault.CTSI || 0n;
-    const fromEth = vault.eth || 0n;
-    const fromUsdc = (vault.usdc || 0n) * 10n ** 12n;
-    return fromSpoofed + fromCtsi + fromEth + fromUsdc;
+    return spoofedOutstandingE8(vault, userKey) * 10n ** 10n;
   };
 
-  /** WLIQ liquid + wWART claims share one pool. */
+  /** WLIQ liquid + wWART claims share one WART-backed pool. */
   const shareClaimed18 = (vault) =>
     (vault.liquid || 0n) + (vault.l1WwartClaim || 0n);
 
@@ -738,7 +1313,7 @@ const handleAdvance = async (request) => {
     const already = shareClaimed18(vault);
     const remaining = capacity > already ? capacity - already : 0n;
 
-    // No free demo mint — need locked WART / portal backing
+    // No free demo mint — need locked WART capacity (not portal ETH/CTSI)
     if (capacity === 0n || remaining === 0n) {
       console.log(
         `[mint_wliq] no capacity — capacity=${capacity} claimed=${already} remaining=${remaining}`,
@@ -1722,21 +2297,15 @@ const handleInspect = async (rawPayload) => {
         ? totalSpoofedMintedE8 - totalSpoofedBurnedE8
         : 0n;
 
-    // Shared mint capacity: prefer history-based outstanding (authoritative).
-    // Fall back to vault counters only when history is empty.
-    // Do NOT use vault.minted−vault.burned when both were mutated (legacy
-    // double-count path left minted reduced AND burned increased).
+    // Mint capacity = locked WART only (history preferred). Portal ETH/CTSI/USDC
+    // are inventory balances — not shared mint headroom with wWART claims.
     let spoofedOut = outstandingE8;
     if (totalSpoofedMintedE8 === 0n && totalSpoofedBurnedE8 === 0n) {
       const m = vault.spoofedMinted || 0n;
       const b = vault.spoofedBurned || 0n;
       spoofedOut = m > b ? m - b : 0n;
     }
-    const capacity18 =
-      spoofedOut * 10n ** 10n +
-      (vault.CTSI || 0n) +
-      (vault.eth || 0n) +
-      (vault.usdc || 0n) * 10n ** 12n;
+    const capacity18 = spoofedOut * 10n ** 10n;
     const claimed18 = (vault.liquid || 0n) + (vault.l1WwartClaim || 0n);
     const remaining18 = capacity18 > claimed18 ? capacity18 - claimed18 : 0n;
 
@@ -1771,6 +2340,63 @@ const handleInspect = async (rawPayload) => {
       CTSI: vault.CTSI.toString(),
       usdc: vault.usdc.toString(),
       eth: formatEther(vault.eth),
+      /** ETH inventory in wei (same as eth human field; for exact UI) */
+      ethWei: (vault.eth || 0n).toString(),
+      /**
+       * Indexed ETH deposit sub-wallets (ETH→WART bridge step 1).
+       * Not mint capacity — portal inventory only.
+       */
+      ethSubs: (() => {
+        const byIdx =
+          ethSubsByOwner.get(address) ||
+          ethSubsByOwner.get(bare) ||
+          ethSubsByOwner.get("0x" + bare);
+        if (!byIdx || byIdx.size === 0) return [];
+        return [...byIdx.entries()]
+          .sort((a, b) => a[0] - b[0])
+          .map(([idx, e]) => ({
+            index: idx,
+            address: e.address,
+            ethWei: (e.ethWei || 0n).toString(),
+            eth: formatEther(e.ethWei || 0n),
+            path: e.path || null,
+          }));
+      })(),
+      /** Cosigner ETH vaults + locked-ETH capacity (separate from WART) */
+      ethVaults: (() => {
+        const list =
+          ethVaultsByOwner.get(address) ||
+          ethVaultsByOwner.get(bare) ||
+          ethVaultsByOwner.get("0x" + bare) ||
+          [];
+        return list.map((r) => {
+          const lm = r.lockedMinted || 0n;
+          const lb = r.lockedBurned || 0n;
+          const out = lm > lb ? lm - lb : 0n;
+          return {
+            vaultAddress: r.vaultAddress,
+            ethSubAddress: r.ethSubAddress,
+            index: r.index,
+            scheme: r.scheme,
+            lockedOutstandingWei: out.toString(),
+            lockedOutstanding: formatEther(out),
+            lockedMintedWei: lm.toString(),
+            lockedBurnedWei: lb.toString(),
+          };
+        });
+      })(),
+      ethLockedMinted: (vault.ethLockedMinted || 0n).toString(),
+      ethLockedBurned: (vault.ethLockedBurned || 0n).toString(),
+      ethLockedOutstanding: ethLockedOutstandingWei(vault).toString(),
+      ethCapacity18: ethBackingCapacity18(vault).toString(),
+      ethClaimed18: ethShareClaimed18(vault).toString(),
+      ethRemaining18: (() => {
+        const c = ethBackingCapacity18(vault);
+        const u = ethShareClaimed18(vault);
+        return (c > u ? c - u : 0n).toString();
+      })(),
+      l1WethClaim: (vault.l1WethClaim || 0n).toString(),
+      wethPortable: (vault.wethPortable || 0n).toString(),
       /** true once this L1 owner has submitted register_address */
       registered: isRegistered,
       spoofedMintHistory: mintHistory.map(m => ({...m, amount: m.amount.toString()})),
