@@ -430,13 +430,27 @@ const handleAdvance = async (request) => {
     return "accept";
   }
 
-  // 2. USER REGISTERS THEIR ADDRESS
+  // 2. USER REGISTERS THEIR ADDRESS (idempotent)
   if (input?.type === "register_address") {
-    const user = sender;
+    const user = String(sender || "").toLowerCase();
+    const already = registeredUsers.has(user) && registeredUsers.get(user) === true;
     registeredUsers.set(user, true);
 
-    await sendNotice(stringToHex(JSON.stringify({ type: "address_registered", user })));
-    console.log("Received register_address from", user);
+    await sendNotice(
+      stringToHex(
+        JSON.stringify({
+          type: "address_registered",
+          user,
+          alreadyRegistered: already,
+        }),
+      ),
+    );
+    console.log(
+      already
+        ? "register_address already registered:"
+        : "Received register_address from",
+      user,
+    );
     return "accept";
   }
 
@@ -1740,6 +1754,11 @@ const handleInspect = async (rawPayload) => {
     const coverableR = portableR + portalWwartReport;
     const burnableR = claimR < coverableR ? claimR : coverableR;
 
+    const isRegistered =
+      registeredUsers.get(address) === true ||
+      registeredUsers.get(bare) === true ||
+      registeredUsers.get("0x" + bare) === true;
+
     const reportPayload = stringToHex(JSON.stringify({
       liquid: vault.liquid.toString(),
       wWART: portalWwartReport.toString(),
@@ -1752,6 +1771,8 @@ const handleInspect = async (rawPayload) => {
       CTSI: vault.CTSI.toString(),
       usdc: vault.usdc.toString(),
       eth: formatEther(vault.eth),
+      /** true once this L1 owner has submitted register_address */
+      registered: isRegistered,
       spoofedMintHistory: mintHistory.map(m => ({...m, amount: m.amount.toString()})),
       spoofedBurnHistory: burnHistory.map(b => ({...b, amount: b.amount.toString()})),
       totalSpoofedMinted: totalSpoofedMintedE8.toString(),
