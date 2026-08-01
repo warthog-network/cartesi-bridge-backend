@@ -6,6 +6,25 @@ const path = require("path");
 const ethers = require("ethers");
 const { Wallet } = require("cartesi-wallet");
 const { stringToHex, hexToString } = require("viem");
+const wartSpv = require("./wartSpv");
+const {
+  isWartSpvInput,
+  createLightClient,
+  applyHeaders,
+  verifyDepositClaim,
+  lcSnapshot,
+  hexNorm: spvHexNorm,
+} = wartSpv;
+
+/** Phase 3 Warthog light client (headers + SPV deposits). */
+const wartLc = createLightClient({
+  poolAccountId: Number(process.env.FUNGIBLE_POOL_ACCOUNT_ID || 81),
+  minConfirmations: Number(process.env.WART_SPV_MIN_CONF || 1),
+  allowBootstrap: process.env.WART_SPV_ALLOW_BOOTSTRAP !== "0",
+  maxHeaders: Number(process.env.WART_SPV_MAX_HEADERS || 512),
+});
+/** When 1, naked pool_deposit (host JSON) is rejected — SPV only. Default 0 for lab. */
+const POOL_REQUIRE_SPV = process.env.POOL_REQUIRE_SPV === "1";
 // cartesi-wallet internal balance map (optional helper paths)
 const wallet = new Wallet(new Map());
 
@@ -131,12 +150,446 @@ const ethVaultReleaseState = new Map();
  */
 const vaultReleaseState = new Map();
 
+/**
+ * Path A — fungible shared pool (SEPARATE from personal 2P cosigner vaults).
+ * Real WART lands on FUNGIBLE_POOL_ADDRESS; capacity is global; claims are per L1 owner.
+ */
+const FUNGIBLE_POOL_ADDRESS = String(
+  process.env.FUNGIBLE_POOL_ADDRESS ||
+    "966d1012941b1fb41d4fff2cadefca7115237dc1818a7cd7",
+)
+  .replace(/^0x/i, "")
+  .toLowerCase();
+const fungiblePool = {
+  poolId: "wart-pool-0",
+  poolAddress: FUNGIBLE_POOL_ADDRESS,
+  lockedE8: 0n,
+  claimed18: 0n,
+  redeemedE8: 0n,
+  nextNonce: 1,
+  /** owner(lower) → { depositedE8, claim18, portable18, redeemedE8 } */
+  users: new Map(),
+  /** credited Warthog tx hashes */
+  usedDepositTxs: new Set(),
+  tickets: [],
+};
+console.log(
+  "[fungible-pool] Path A pool address:",
+  fungiblePool.poolAddress,
+  "(personal cosigner vaults unchanged)",
+);
+
+function ensurePoolUser(owner) {
+  const o = String(owner || "").toLowerCase();
+  let u = fungiblePool.users.get(o);
+  if (!u) {
+    u = {
+      depositedE8: 0n,
+      claim18: 0n,
+      portable18: 0n,
+      redeemedE8: 0n,
+    };
+    fungiblePool.users.set(o, u);
+  }
+  return u;
+}
+
+function poolCapacity18() {
+  return fungiblePool.lockedE8 * 10n ** 10n;
+}
+
+function poolAvailable18() {
+  const c = poolCapacity18();
+  const u = fungiblePool.claimed18;
+  return c > u ? c - u : 0n;
+}
+
+/** Open claims → E8 floor (1 WART claim = 1e18 → 1e8 E8). */
+function claimedToE8(claimed18) {
+  return BigInt(claimed18 || 0n) / 10n ** 10n;
+}
+
+/**
+ * Global freeable WART (E8): locked collateral not required for open claims.
+ * freeable = lockedE8 − floor(claimed18 / 1e10)
+ */
+function poolFreeableE8() {
+  const need = claimedToE8(fungiblePool.claimed18);
+  return fungiblePool.lockedE8 > need
+    ? fungiblePool.lockedE8 - need
+    : 0n;
+}
+
+/**
+ * User freeable deposit (E8): min(user.depositedE8, global freeable).
+ * After burn of filled claims this is what can be paid out without an open portable claim.
+ */
+function userFreeableE8(owner) {
+  const pu = ensurePoolUser(owner);
+  const g = poolFreeableE8();
+  return pu.depositedE8 < g ? pu.depositedE8 : g;
+}
+
+/**
+ * Debit depositors FIFO when holder redeem spends collateral not only the redeemer's.
+ * Prefer `preferOwner` first, then Map insertion order. Throws if accounting shortfall.
+ * @returns {{ owner: string, e8: string }[]}
+ */
+function debitDepositsFifo(e8, preferOwner = null) {
+  let left = BigInt(e8);
+  const debits = [];
+  if (left <= 0n) return debits;
+
+  const take = (owner) => {
+    if (left <= 0n) return;
+    const o = String(owner || "").toLowerCase();
+    if (!o) return;
+    const pu = ensurePoolUser(o);
+    if (pu.depositedE8 <= 0n) return;
+    const d = pu.depositedE8 < left ? pu.depositedE8 : left;
+    pu.depositedE8 -= d;
+    left -= d;
+    if (d > 0n) debits.push({ owner: o, e8: d.toString() });
+  };
+
+  if (preferOwner) take(preferOwner);
+  for (const [owner] of fungiblePool.users) {
+    if (
+      preferOwner &&
+      owner === String(preferOwner).toLowerCase()
+    ) {
+      continue;
+    }
+    take(owner);
+    if (left <= 0n) break;
+  }
+  if (left > 0n) {
+    throw new Error(
+      `debitDepositsFifo: shortfall ${left} E8 (sum deposited < locked spend)`,
+    );
+  }
+  return debits;
+}
+
+/**
+ * Debit filled personal pool claims (claim − portable) when a bearer burns wWART (A-β).
+ * Soft: logs and returns partial debits if personal maps lag global claimed.
+ * @returns {{ owner: string, amount18: string }[]}
+ */
+function debitFilledClaimsFifo(amount18, preferOwner = null) {
+  let left = BigInt(amount18);
+  const debits = [];
+  if (left <= 0n) return debits;
+
+  const take = (owner) => {
+    if (left <= 0n) return;
+    const o = String(owner || "").toLowerCase();
+    if (!o) return;
+    const vault = userVaults.get(o);
+    const pu = ensurePoolUser(o);
+    const claim = vault
+      ? vault.poolL1WwartClaim || 0n
+      : pu.claim18 || 0n;
+    const portable = vault
+      ? vault.poolWwartPortable || 0n
+      : pu.portable18 || 0n;
+    const filled = filledClaim18(claim, portable);
+    if (filled <= 0n) return;
+    const d = filled < left ? filled : left;
+    if (vault) {
+      vault.poolL1WwartClaim = claim - d;
+      userVaults.set(o, vault);
+    }
+    if (pu.claim18 >= d) pu.claim18 -= d;
+    else pu.claim18 = 0n;
+    left -= d;
+    debits.push({ owner: o, amount18: d.toString() });
+  };
+
+  if (preferOwner) take(preferOwner);
+  for (const [owner] of fungiblePool.users) {
+    if (
+      preferOwner &&
+      owner === String(preferOwner).toLowerCase()
+    ) {
+      continue;
+    }
+    take(owner);
+    if (left <= 0n) break;
+  }
+  if (left > 0n) {
+    for (const [owner] of userVaults) {
+      if (
+        preferOwner &&
+        owner === String(preferOwner).toLowerCase()
+      ) {
+        continue;
+      }
+      take(owner);
+      if (left <= 0n) break;
+    }
+  }
+  if (left > 0n) {
+    console.warn(
+      `[debitFilledClaimsFifo] personal claim shortfall ${left} (global claimed already authoritative)`,
+    );
+  }
+  return debits;
+}
+
+function poolSnapshot(owner = null) {
+  const freeableE8 = poolFreeableE8();
+  const snap = {
+    poolId: fungiblePool.poolId,
+    poolAddress: fungiblePool.poolAddress,
+    scheme: "wart-fungible-pool-v0",
+    redeemPhase: "A-beta",
+    holderRedeem: true,
+    spv: {
+      requireSpv: POOL_REQUIRE_SPV,
+      ...lcSnapshot(wartLc),
+    },
+    lockedE8: fungiblePool.lockedE8.toString(),
+    capacity18: poolCapacity18().toString(),
+    claimed18: fungiblePool.claimed18.toString(),
+    available18: poolAvailable18().toString(),
+    redeemedE8: fungiblePool.redeemedE8.toString(),
+    freeableE8: freeableE8.toString(),
+    nextNonce: fungiblePool.nextNonce,
+    recentTickets: fungiblePool.tickets.slice(-10),
+  };
+  if (owner) {
+    const o = String(owner).toLowerCase();
+    const u = fungiblePool.users.get(o);
+    const userFree = userFreeableE8(o);
+    snap.user = u
+      ? {
+          owner: o,
+          depositedE8: u.depositedE8.toString(),
+          claim18: u.claim18.toString(),
+          portable18: u.portable18.toString(),
+          redeemedE8: u.redeemedE8.toString(),
+          freeableE8: userFree.toString(),
+        }
+      : {
+          owner: o,
+          depositedE8: "0",
+          claim18: "0",
+          portable18: "0",
+          redeemedE8: "0",
+          freeableE8: "0",
+        };
+  }
+  return snap;
+}
+
+/**
+ * Release locked pool WART + emit pool_release_ticket for hot-wallet payout.
+ * Caller must ensure amtE8 ≤ freeable / accounting invariants.
+ * @returns {object} ticket
+ */
+async function issuePoolReleaseTicket({
+  user,
+  amtE8,
+  amount18 = null,
+  toAddress = null,
+  reason = "unlock",
+}) {
+  const owner = String(user || "").toLowerCase();
+  const e8 = BigInt(amtE8);
+  if (e8 <= 0n) throw new Error("issuePoolReleaseTicket: amtE8 must be > 0");
+  if (fungiblePool.lockedE8 < e8) {
+    throw new Error("issuePoolReleaseTicket: insufficient lockedE8");
+  }
+
+  fungiblePool.lockedE8 -= e8;
+  fungiblePool.redeemedE8 += e8;
+  // Collateral attribution: redeemer first, then FIFO other depositors (A-β holder redeem).
+  let depositDebits = [];
+  try {
+    depositDebits = debitDepositsFifo(e8, owner);
+  } catch (e) {
+    // Roll back locked if deposit map cannot cover (should not happen if invariants hold).
+    fungiblePool.lockedE8 += e8;
+    fungiblePool.redeemedE8 -= e8;
+    throw e;
+  }
+  const pu = ensurePoolUser(owner);
+  pu.redeemedE8 += e8;
+
+  const isBeta =
+    reason === "holder-burn-unlock" || reason === "holder-redeem";
+  const nonce = fungiblePool.nextNonce++;
+  const ticketId = `${fungiblePool.poolId}:${nonce}`;
+  const to =
+    toAddress != null && String(toAddress).trim()
+      ? String(toAddress).replace(/^0x/i, "").toLowerCase()
+      : null;
+  const amount18Str =
+    amount18 != null
+      ? String(amount18)
+      : (e8 * 10n ** 10n).toString();
+  const ticket = {
+    type: "pool_release_ticket",
+    scheme: "wart-pool-release-ticket-v0",
+    ticketId,
+    nonce,
+    poolId: fungiblePool.poolId,
+    poolAddress: fungiblePool.poolAddress,
+    owner,
+    toAddress: to,
+    amountE8: e8.toString(),
+    amount18: amount18Str,
+    phase: isBeta ? "A-beta" : "A-alpha",
+    source: "pool",
+    reason,
+    depositDebits,
+    message:
+      reason === "holder-burn-unlock" || reason === "holder-redeem"
+        ? "Path A A-β holder redeem — any wWART bearer may burn portal inventory; hot wallet pays amountE8 WART to toAddress"
+        : reason === "portable-redeem"
+          ? "Path A redeem ticket — hot wallet may pay amountE8 WART from pool address to toAddress"
+          : "Path A unlock ticket — free headroom after burn/claim closed; hot wallet pays amountE8 WART",
+  };
+  fungiblePool.tickets.push(ticket);
+  if (fungiblePool.tickets.length > 200) {
+    fungiblePool.tickets = fungiblePool.tickets.slice(-200);
+  }
+  await sendNotice(stringToHex(JSON.stringify(ticket)));
+  return ticket;
+}
+
+/**
+ * Portal ERC-20 wWART is 18-dec. Legacy sweeps wrote spoofed E8 into wWART —
+ * never treat values below 1e15 as real portal inventory.
+ */
+function portalWwart18Of(raw) {
+  const w = BigInt(raw || 0n);
+  if (w > 0n && w < 10n ** 15n) return 0n;
+  return w;
+}
+
+/** Filled claim still on L1 = claim − portable (not yet returned). */
+function filledClaim18(claim, portable) {
+  const c = BigInt(claim || 0n);
+  const p = BigInt(portable || 0n);
+  const open = p < c ? p : c;
+  return c > open ? c - open : 0n;
+}
+
+/**
+ * Credit portal-deposited wWART into path-isolated buckets.
+ * - vault.wWART          = Path B (personal) portal inventory
+ * - vault.poolPortalWwart = Path A (pool) portal inventory
+ * pathHint: "pool" | "personal" | null (auto)
+ * Auto: fill pool filled shortfall first, then personal (keeps Path A reverse working).
+ * @returns {{ path: string, poolCredited: bigint, personalCredited: bigint }}
+ */
+function creditWwartPortal(vault, amount, pathHint = null) {
+  const amt = BigInt(amount || 0n);
+  if (amt <= 0n) {
+    return { path: "none", poolCredited: 0n, personalCredited: 0n };
+  }
+  const hint = pathHint ? String(pathHint).toLowerCase().trim() : "";
+  if (hint === "pool" || hint === "a" || hint === "path-a") {
+    vault.poolPortalWwart = (vault.poolPortalWwart || 0n) + amt;
+    return { path: "pool", poolCredited: amt, personalCredited: 0n };
+  }
+  if (hint === "personal" || hint === "b" || hint === "path-b" || hint === "vault") {
+    vault.wWART = portalWwart18Of(vault.wWART) + amt;
+    return { path: "personal", poolCredited: 0n, personalCredited: amt };
+  }
+
+  const poolFilled = filledClaim18(
+    vault.poolL1WwartClaim,
+    vault.poolWwartPortable,
+  );
+  const personalFilled = filledClaim18(vault.l1WwartClaim, vault.wwartPortable);
+
+  // Only personal filled (or neither with no pool claim) → personal
+  if (poolFilled === 0n && personalFilled > 0n) {
+    vault.wWART = portalWwart18Of(vault.wWART) + amt;
+    return { path: "personal", poolCredited: 0n, personalCredited: amt };
+  }
+  // Only pool filled → pool (Path A reverse deposit)
+  if (personalFilled === 0n && poolFilled > 0n) {
+    vault.poolPortalWwart = (vault.poolPortalWwart || 0n) + amt;
+    return { path: "pool", poolCredited: amt, personalCredited: 0n };
+  }
+  // Both filled: cover pool shortfall first, remainder personal
+  if (poolFilled > 0n && personalFilled > 0n) {
+    const toPool = amt < poolFilled ? amt : poolFilled;
+    const toPersonal = amt - toPool;
+    if (toPool > 0n) {
+      vault.poolPortalWwart = (vault.poolPortalWwart || 0n) + toPool;
+    }
+    if (toPersonal > 0n) {
+      vault.wWART = portalWwart18Of(vault.wWART) + toPersonal;
+    }
+    return {
+      path: "split",
+      poolCredited: toPool,
+      personalCredited: toPersonal,
+    };
+  }
+  // No filled claims on this L1 owner:
+  // A-β — if the pool has open global claims, credit Path A portal so a bearer
+  // who bought wWART can burn/redeem without having minted themselves.
+  if (fungiblePool.claimed18 > 0n) {
+    vault.poolPortalWwart = (vault.poolPortalWwart || 0n) + amt;
+    return { path: "pool", poolCredited: amt, personalCredited: 0n };
+  }
+  // Idle pool: default personal (Path B)
+  vault.wWART = portalWwart18Of(vault.wWART) + amt;
+  return { path: "personal", poolCredited: 0n, personalCredited: amt };
+}
+
+/** Optional path tag from ERC20 portal exec layer data (after amount). */
+function parsePortalPathHint(payloadHex, amountEndOffsetBytes) {
+  try {
+    const hex = String(payloadHex || "").replace(/^0x/i, "").toLowerCase();
+    const o = amountEndOffsetBytes * 2;
+    if (hex.length <= o) return null;
+    const rest = hex.slice(o);
+    if (!rest || rest.length < 2) return null;
+    let text = "";
+    try {
+      text = Buffer.from(rest, "hex").toString("utf8").replace(/\0/g, "").trim();
+    } catch {
+      return null;
+    }
+    if (!text) return null;
+    const lower = text.toLowerCase();
+    if (lower.includes("pool") || lower === "a" || lower.includes("path-a")) {
+      return "pool";
+    }
+    if (
+      lower.includes("personal") ||
+      lower.includes("vault") ||
+      lower === "b" ||
+      lower.includes("path-b")
+    ) {
+      return "personal";
+    }
+    try {
+      const j = JSON.parse(text);
+      if (j?.path) return String(j.path).toLowerCase();
+    } catch {
+      /* not json */
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function ensureUserVaultShell(user) {
   const u = String(user || "").toLowerCase();
   let v = userVaults.get(u);
   if (!v) {
     v = {
       liquid: 0n,
+      /** Path B personal portal wWART inventory (18-dec) */
       wWART: 0n,
       CTSI: 0n,
       usdc: 0n,
@@ -145,10 +598,17 @@ function ensureUserVaultShell(user) {
       spoofedBurned: 0n,
       l1WwartClaim: 0n,
       wwartPortable: 0n,
+      /** Path A pool claims — not personal vault capacity */
+      poolL1WwartClaim: 0n,
+      poolWwartPortable: 0n,
+      /** Path A portal-returned wWART (18-dec) — isolated from personal wWART */
+      poolPortalWwart: 0n,
       ethLockedMinted: 0n,
       ethLockedBurned: 0n,
       l1WethClaim: 0n,
       wethPortable: 0n,
+      /** Native Warthog ETH assets linked to mint amounts (client createAssets) */
+      ethWartAssets: [],
     };
     userVaults.set(u, v);
   } else {
@@ -156,7 +616,12 @@ function ensureUserVaultShell(user) {
     if (v.ethLockedBurned == null) v.ethLockedBurned = 0n;
     if (v.l1WethClaim == null) v.l1WethClaim = 0n;
     if (v.wethPortable == null) v.wethPortable = 0n;
+    if (v.poolL1WwartClaim == null) v.poolL1WwartClaim = 0n;
+    if (v.poolWwartPortable == null) v.poolWwartPortable = 0n;
+    if (v.poolPortalWwart == null) v.poolPortalWwart = 0n;
+    if (!Array.isArray(v.ethWartAssets)) v.ethWartAssets = [];
   }
+  if (!Array.isArray(v.ethWartAssets)) v.ethWartAssets = [];
   return v;
 }
 
@@ -542,6 +1007,139 @@ const handleAdvance = async (request) => {
     return "accept";
   }
 
+  // Phase 3 SPV — light client headers + deposit claims
+  if (isWartSpvInput(input)) {
+    try {
+      if (input.type === "wart_checkpoint" || (input.type === "wart_headers" && input.bootstrap)) {
+        const headers = input.headers || (input.header ? [input.header] : []);
+        if (!headers.length && input.checkpointHash) {
+          // Minimal checkpoint without full window
+          wartLc.bootstrapped = true;
+          wartLc.checkpointHeight = Number(input.checkpointHeight || input.height || 0);
+          wartLc.checkpointHash = spvHexNorm(input.checkpointHash);
+          wartLc.bestHeight = wartLc.checkpointHeight;
+          wartLc.bestHash = wartLc.checkpointHash;
+          wartLc.byHeight.set(wartLc.checkpointHeight, {
+            hash: wartLc.bestHash,
+            prevHash: spvHexNorm(input.prevHash || "00".repeat(32)),
+            merkleroot: spvHexNorm(input.merkleroot || "00".repeat(32)),
+          });
+          if (input.pinHeight != null) wartLc.pinHeight = Number(input.pinHeight);
+          if (input.pinHash) wartLc.pinHash = spvHexNorm(input.pinHash);
+        } else {
+          applyHeaders(wartLc, headers, {
+            bootstrap: true,
+            pinHeight: input.pinHeight,
+            pinHash: input.pinHash,
+          });
+        }
+        await sendNotice(
+          stringToHex(
+            JSON.stringify({
+              type: "wart_headers_applied",
+              bootstrap: true,
+              ...lcSnapshot(wartLc),
+            }),
+          ),
+        );
+        console.log("[wart_spv] bootstrapped / headers", lcSnapshot(wartLc));
+        return "accept";
+      }
+
+      if (input.type === "wart_headers") {
+        applyHeaders(wartLc, input.headers || [], {
+          bootstrap: false,
+          pinHeight: input.pinHeight,
+          pinHash: input.pinHash,
+        });
+        await sendNotice(
+          stringToHex(
+            JSON.stringify({
+              type: "wart_headers_applied",
+              bootstrap: false,
+              ...lcSnapshot(wartLc),
+            }),
+          ),
+        );
+        console.log("[wart_spv] headers applied tip", wartLc.bestHeight);
+        return "accept";
+      }
+
+      if (input.type === "wart_deposit_claim") {
+        const owner = String(input.owner || sender || "").toLowerCase();
+        if (!owner.startsWith("0x") || owner.length !== 42) {
+          throw new Error("wart_deposit_claim requires owner L1 address");
+        }
+        const credit = verifyDepositClaim(input, wartLc, {
+          poolAccountId: wartLc.poolAccountId,
+        });
+        const txKey = credit.txKey;
+        if (fungiblePool.usedDepositTxs.has(txKey)) {
+          throw new Error(`duplicate deposit txKey ${txKey.slice(0, 16)}`);
+        }
+        const amtE8 = credit.amountE8n;
+        fungiblePool.usedDepositTxs.add(txKey);
+        // Also mark human-readable hash if provided
+        if (input.txHash || input.tx?.hash) {
+          fungiblePool.usedDepositTxs.add(
+            spvHexNorm(input.txHash || input.tx.hash),
+          );
+        }
+        fungiblePool.lockedE8 += amtE8;
+        const pu = ensurePoolUser(owner);
+        pu.depositedE8 += amtE8;
+        ensureUserVaultShell(owner);
+
+        await sendNotice(
+          stringToHex(
+            JSON.stringify({
+              type: "pool_deposit",
+              scheme: "wart-deposit-claim-v0",
+              verification: "spv-v0",
+              ...poolSnapshot(owner),
+              owner,
+              amountE8: amtE8.toString(),
+              fromAccountId: credit.originAccountId,
+              toAccountId: credit.toAccountId,
+              txHash: input.txHash || input.tx?.hash || txKey,
+              txKey,
+              blockHeight: credit.blockHeight,
+              headerHash: credit.headerHash,
+              confirmations: credit.confirmations,
+              source: "pool",
+              lc: lcSnapshot(wartLc),
+              message:
+                "SPV-verified WART deposit to pool — mint headroom increased (Path A)",
+            }),
+          ),
+        );
+        console.log(
+          `[wart_deposit_claim] ${owner} +${amtE8} E8 h=${credit.blockHeight} locked=${fungiblePool.lockedE8}`,
+        );
+        return "accept";
+      }
+
+      throw new Error(`unknown SPV input ${input.type}`);
+    } catch (e) {
+      console.log(`[wart_spv] reject: ${e?.message || e}`);
+      try {
+        await sendNotice(
+          stringToHex(
+            JSON.stringify({
+              type: "wart_spv_rejected",
+              reason: e?.message || String(e),
+              inputType: input?.type || null,
+              lc: lcSnapshot(wartLc),
+            }),
+          ),
+        );
+      } catch {
+        /* ignore */
+      }
+      return "reject";
+    }
+  }
+
   // 2. USER REGISTERS THEIR ADDRESS (idempotent)
   if (input?.type === "register_address") {
     const user = String(sender || "").toLowerCase();
@@ -904,7 +1502,10 @@ const handleAdvance = async (request) => {
 
   /**
    * mint_weth_claim — mint rollup wETH claim against locked ETH capacity only.
-   * Not WART capacity. Temporary until Warthog DeFi WETH / L1 WETH voucher path.
+   * Not WART capacity.
+   * Optional client fields (after createAssets on Warthog):
+   *   assetHash, assetName, assetAmount, assetDecimals, wartAddress, assetTxHash
+   * Links the native Warthog ETH asset to this claim amount (value-linked).
    */
   if (input?.type === "mint_weth_claim" || input?.type === "mint_weth") {
     const user = String(sender || "").toLowerCase();
@@ -939,6 +1540,40 @@ const handleAdvance = async (request) => {
     const mintAmt = requested > remaining ? remaining : requested;
     vault.l1WethClaim = (vault.l1WethClaim || 0n) + mintAmt;
     vault.wethPortable = (vault.wethPortable || 0n) + mintAmt;
+
+    // Optional: native Warthog ETH asset link (client createAssets, amount-linked)
+    let ethAssetLink = null;
+    const rawHash = input.assetHash != null ? String(input.assetHash).trim() : "";
+    const assetHash = rawHash.replace(/^0x/i, "").toLowerCase();
+    if (assetHash && /^[0-9a-f]{64}$/.test(assetHash)) {
+      ethAssetLink = {
+        assetHash,
+        assetName: String(input.assetName || "WETH")
+          .trim()
+          .toUpperCase()
+          .slice(0, 5),
+        amountWei: mintAmt.toString(),
+        amount: formatEther(mintAmt),
+        assetAmount:
+          input.assetAmount != null ? String(input.assetAmount) : formatEther(mintAmt),
+        assetDecimals:
+          input.assetDecimals != null ? Number(input.assetDecimals) : 8,
+        wartAddress: input.wartAddress
+          ? String(input.wartAddress).replace(/^0x/i, "").toLowerCase()
+          : null,
+        assetTxHash: input.assetTxHash
+          ? String(input.assetTxHash).replace(/^0x/i, "").toLowerCase()
+          : null,
+        timestamp: Date.now(),
+      };
+      if (!Array.isArray(vault.ethWartAssets)) vault.ethWartAssets = [];
+      vault.ethWartAssets.push(ethAssetLink);
+      // keep last 32 links
+      if (vault.ethWartAssets.length > 32) {
+        vault.ethWartAssets = vault.ethWartAssets.slice(-32);
+      }
+    }
+
     userVaults.set(user, vault);
 
     await sendNotice(
@@ -957,12 +1592,20 @@ const handleAdvance = async (request) => {
               ? capacity - ethShareClaimed18(vault)
               : 0n
           ).toString(),
-          message:
-            "wETH claim minted against locked ETH (rollup claim only — L1 WETH when DeFi path exists)",
+          assetHash: ethAssetLink?.assetHash || null,
+          assetName: ethAssetLink?.assetName || null,
+          assetAmount: ethAssetLink?.assetAmount || null,
+          wartAddress: ethAssetLink?.wartAddress || null,
+          message: ethAssetLink
+            ? `wETH claim + Warthog ETH asset ${ethAssetLink.assetHash.slice(0, 12)}… linked to ${formatEther(mintAmt)} ETH capacity`
+            : "wETH claim minted against locked ETH (rollup). Attach assetHash after createAssets for Warthog ETH link.",
         }),
       ),
     );
-    console.log(`[mint_weth_claim] ${user} +${formatEther(mintAmt)} wETH claim`);
+    console.log(
+      `[mint_weth_claim] ${user} +${formatEther(mintAmt)} wETH claim` +
+        (ethAssetLink ? ` asset=${ethAssetLink.assetHash.slice(0, 16)}` : ""),
+    );
     return "accept";
   }
 
@@ -1105,21 +1748,29 @@ const handleAdvance = async (request) => {
 
     if (amount === 0n) return "accept";
 
-    let vault = userVaults.get(depositor) || {
-      liquid: 0n, wWART: 0n, CTSI: 0n, usdc: 0n, eth: 0n,
-      spoofedMinted: 0n, spoofedBurned: 0n, l1WwartClaim: 0n, wwartPortable: 0n,
-    };
+    const vault = ensureUserVaultShell(depositor);
 
     let type = "unknown";
+    let creditMeta = null;
     if (tokenAddress === WWART_ADDRESS.toLowerCase()) {
-      // Portal inventory only. Capacity claim (l1WwartClaim) stays used until
-      // explicit burn_wwart — deposit does NOT free Available / Used.
-      vault.wWART = (vault.wWART || 0n) + amount;
+      // Path-isolated portal inventory. Claims stay used until burn_* —
+      // deposit does NOT free Available / Used.
+      // Payload: [optional 1-byte prefix] token(20)||depositor(20)||amount(32)||execData
+      // Try path hint from execData (both offset layouts).
+      const pathHint =
+        parsePortalPathHint(request.payload, 72) ||
+        parsePortalPathHint(request.payload, 73);
+      creditMeta = creditWwartPortal(vault, amount, pathHint);
       type = "wwart_deposited";
+      console.log(
+        `[wwart portal] ${depositor} +${amount} path=${creditMeta.path} pool+=${creditMeta.poolCredited} personal+=${creditMeta.personalCredited}`,
+      );
     } else if (tokenAddress === CTSI_ADDRESS.toLowerCase()) {
-      vault.CTSI += amount; type = "ctsi_deposited";
+      vault.CTSI = (vault.CTSI || 0n) + amount;
+      type = "ctsi_deposited";
     } else if (tokenAddress === USDC_ADDRESS.toLowerCase()) {
-      vault.usdc += amount; type = "usdc_deposited";
+      vault.usdc = (vault.usdc || 0n) + amount;
+      type = "usdc_deposited";
     } else {
       console.log("Unknown token — ignoring", tokenAddress);
       return "accept";
@@ -1131,15 +1782,25 @@ const handleAdvance = async (request) => {
       type,
       user: depositor,
       amount: amount.toString(),
-      newBalance: type === "wwart_deposited" ? vault.wWART.toString() :
-                  type === "ctsi_deposited" ? vault.CTSI.toString() :
+      newBalance: type === "wwart_deposited"
+        ? (portalWwart18Of(vault.wWART) + (vault.poolPortalWwart || 0n)).toString()
+        : type === "ctsi_deposited" ? vault.CTSI.toString() :
                   vault.usdc.toString(),
       ...(type === "wwart_deposited"
         ? {
+            path: creditMeta?.path || "personal",
+            poolPortalCredited: (creditMeta?.poolCredited || 0n).toString(),
+            personalPortalCredited: (creditMeta?.personalCredited || 0n).toString(),
             l1WwartClaim: (vault.l1WwartClaim || 0n).toString(),
-            wWART: (vault.wWART || 0n).toString(),
+            wWART: portalWwart18Of(vault.wWART).toString(),
+            poolPortalWwart: (vault.poolPortalWwart || 0n).toString(),
+            poolL1WwartClaim: (vault.poolL1WwartClaim || 0n).toString(),
             message:
-              "wWART deposited to rollup balance — capacity claim still used until burn_wwart",
+              creditMeta?.path === "pool"
+                ? "wWART deposited to Path A pool portal — burn with pool_burn_wwart (personal burn cannot use this inventory)"
+                : creditMeta?.path === "split"
+                  ? "wWART deposited split across Path A pool portal + Path B personal portal"
+                  : "wWART deposited to Path B personal portal — burn with burn_wwart (pool burn cannot use this inventory)",
           }
         : {}),
     })));
@@ -1496,16 +2157,17 @@ const handleAdvance = async (request) => {
   }
 
   /**
-   * burn_wwart — free shared capacity by burning wWART claims.
+   * burn_wwart — free Path B personal capacity by burning personal wWART claims.
    *
    * Open vs filled (must not free capacity while ERC-20 sits only on MetaMask):
    *   openClaim   = wwartPortable          (not yet withdrawn to L1)
    *   filledClaim = l1WwartClaim − portable (already voucher-minted to MetaMask)
-   *   burnable    = min(claim, portable + portalInventory)
+   *   burnable    = min(claim, portable + personalPortalInventory)
    *
+   * Uses vault.wWART (personal portal) only — NOT poolPortalWwart (Path A).
    * Open claims can be burned immediately (cancel unused claim).
-   * Filled claims require depositing L1 wWART back first (portal inventory),
-   * then burn_wwart debits portal 1:1 with claim free.
+   * Filled claims require depositing L1 wWART back first (personal portal),
+   * then burn_wwart debits personal portal 1:1 with claim free.
    * Does not burn native locked WART / spoofed outstanding.
    */
   if ((input?.type === "burn_wwart" || input?.type === "burn_wwart_claim") && input.amount) {
@@ -1525,12 +2187,13 @@ const handleAdvance = async (request) => {
     }
     const claim = vault.l1WwartClaim || 0n;
     const portable = vault.wwartPortable || 0n;
-    // Portal 18-dec inventory (ignore legacy E8 pollution in wWART field)
+    // Path B personal portal only (ignore legacy E8 pollution)
     const portalRaw = vault.wWART || 0n;
-    const portal = portalRaw > 0n && portalRaw < 10n ** 15n ? 0n : portalRaw;
+    const portal = portalWwart18Of(portalRaw);
+    const poolPortal = portalWwart18Of(vault.poolPortalWwart);
     const openClaim = portable < claim ? portable : claim;
     const filledClaim = claim > openClaim ? claim - openClaim : 0n;
-    // Cover for capacity free: open portable + returned L1 inventory only
+    // Cover for capacity free: open portable + Path B returned L1 inventory only
     const coverable = portable + portal;
     const burnable = claim < coverable ? claim : coverable;
 
@@ -1540,7 +2203,7 @@ const handleAdvance = async (request) => {
     }
     if (amount > burnable) {
       console.log(
-        `[burn_wwart] reject — filled on L1 without return: amount=${amount} burnable=${burnable} open=${openClaim} filled=${filledClaim} portal=${portal}`,
+        `[burn_wwart] reject — filled on L1 without personal return: amount=${amount} burnable=${burnable} open=${openClaim} filled=${filledClaim} personalPortal=${portal} poolPortal=${poolPortal}`,
       );
       await sendNotice(
         stringToHex(
@@ -1554,9 +2217,12 @@ const handleAdvance = async (request) => {
             wwartOpenClaim: openClaim.toString(),
             wwartFilledClaim: filledClaim.toString(),
             wwartPortal: portal.toString(),
+            poolPortalWwart: poolPortal.toString(),
             wwartBurnable: burnable.toString(),
             message:
-              "Cannot free filled wWART claims while ERC-20 is still on MetaMask. Deposit L1 wWART back to the rollup first, then burn claims. Open (unfilled) portable can burn without deposit.",
+              poolPortal > 0n && portal === 0n
+                ? "Path A pool portal wWART cannot cover a Path B personal burn. Deposit while only a personal filled claim is open (auto-routes to personal portal), then burn_wwart."
+                : "Cannot free filled personal wWART claims while ERC-20 is still on MetaMask. Deposit L1 wWART back to the rollup (personal portal) first, then burn. Open portable can burn without deposit.",
           }),
         ),
       );
@@ -1564,7 +2230,7 @@ const handleAdvance = async (request) => {
     }
 
     vault.l1WwartClaim = claim - amount;
-    // Debit inventory 1:1 with claim free (portable first, then portal deposit).
+    // Debit inventory 1:1 with claim free (portable first, then personal portal).
     let invLeft = amount;
     if (portable > 0n && invLeft > 0n) {
       const d = portable >= invLeft ? invLeft : portable;
@@ -1605,6 +2271,713 @@ const handleAdvance = async (request) => {
     })));
     console.log(`[burn_wwart] ${user} -${amount} claim remaining=${vault.l1WwartClaim}`);
     return "accept";
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PATH A — FUNGIBLE POOL (does not touch personal cosigner vaults / spoofed)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * pool_deposit — legacy host-attested deposit (lab).
+   * Prefer wart_deposit_claim (SPV). Set POOL_REQUIRE_SPV=1 to reject this path.
+   */
+  if (input?.type === "pool_deposit") {
+    if (POOL_REQUIRE_SPV) {
+      console.log("[pool_deposit] reject: POOL_REQUIRE_SPV=1 — use wart_deposit_claim");
+      try {
+        await sendNotice(
+          stringToHex(
+            JSON.stringify({
+              type: "pool_deposit_rejected",
+              reason: "POOL_REQUIRE_SPV=1 — submit wart_deposit_claim",
+              message: "Legacy pool_deposit disabled; SPV path required",
+            }),
+          ),
+        );
+      } catch {
+        /* ignore */
+      }
+      return "reject";
+    }
+    const owner = String(input.owner || sender).toLowerCase();
+    const proof = input.depositProof || input.proof || input.sweepProof;
+    const tx = normalizeWarthogTx(proof);
+
+    /** Emit reject notice so FE can fail fast instead of hanging on waitForNotice. */
+    const rejectDeposit = async (reason, extra = {}) => {
+      console.log(`[pool_deposit] reject: ${reason}`, extra);
+      try {
+        await sendNotice(
+          stringToHex(
+            JSON.stringify({
+              type: "pool_deposit_rejected",
+              scheme: "wart-pool-deposit-v0",
+              owner,
+              reason,
+              txHash: extra.txHash || tx?.txHash || null,
+              toAddress: extra.toAddress || tx?.toAddress || null,
+              amountE8:
+                extra.amountE8 != null
+                  ? String(extra.amountE8)
+                  : tx?.amountE8 != null
+                    ? String(tx.amountE8)
+                    : null,
+              poolAddress: fungiblePool.poolAddress,
+              message: reason,
+            }),
+          ),
+        );
+      } catch (e) {
+        console.error("[pool_deposit] reject notice failed:", e?.message || e);
+      }
+      return "reject";
+    };
+
+    if (!tx || !tx.toAddress || !(Number(tx.amountE8) > 0)) {
+      return await rejectDeposit("invalid deposit proof (missing to/amount)");
+    }
+    const toNorm = String(tx.toAddress).replace(/^0x/i, "").toLowerCase();
+    if (toNorm !== fungiblePool.poolAddress) {
+      return await rejectDeposit(
+        `to address is not the fungible pool (got ${toNorm.slice(0, 12)}…)`,
+        { toAddress: toNorm },
+      );
+    }
+    const txHash = String(tx.txHash || "").toLowerCase();
+    if (txHash && fungiblePool.usedDepositTxs.has(txHash)) {
+      return await rejectDeposit("duplicate Warthog deposit tx", { txHash });
+    }
+    const amtE8 = BigInt(String(tx.amountE8));
+    if (amtE8 <= 0n) {
+      return await rejectDeposit("amount must be > 0", { amountE8: "0" });
+    }
+
+    if (txHash) fungiblePool.usedDepositTxs.add(txHash);
+    fungiblePool.lockedE8 += amtE8;
+    const pu = ensurePoolUser(owner);
+    pu.depositedE8 += amtE8;
+    ensureUserVaultShell(owner);
+
+    await sendNotice(
+      stringToHex(
+        JSON.stringify({
+          type: "pool_deposit",
+          scheme: "wart-pool-deposit-v0",
+          ...poolSnapshot(owner),
+          owner,
+          amountE8: amtE8.toString(),
+          fromAddress: tx.fromAddress || null,
+          txHash: txHash || null,
+          source: "pool",
+          message:
+            "Real WART deposited to fungible pool — mint headroom increased (Path A)",
+        }),
+      ),
+    );
+    console.log(
+      `[pool_deposit] ${owner} +${amtE8} E8 locked=${fungiblePool.lockedE8}`,
+    );
+    return "accept";
+  }
+
+  /**
+   * pool_mint_wwart — mint claim against *pool* capacity only.
+   * Credits poolL1WwartClaim + poolWwartPortable (not personal l1WwartClaim).
+   */
+  if (input?.type === "pool_mint_wwart") {
+    const user = sender;
+    if (!WWART_ADDRESS || WWART_ADDRESS === "0x0000000000000000000000000000000000000000") {
+      console.log("[pool_mint_wwart] WWART_ADDRESS not configured");
+      return "reject";
+    }
+    const reqToken = String(input.tokenAddress || "").toLowerCase();
+    if (!reqToken || reqToken !== WWART_ADDRESS) {
+      console.log(
+        `[pool_mint_wwart] token mismatch got=${reqToken || "none"} want=${WWART_ADDRESS}`,
+      );
+      return "accept";
+    }
+    let requested;
+    try {
+      requested = parseHumanTo18(input.amount, "1");
+    } catch {
+      return "reject";
+    }
+    if (requested <= 0n) return "reject";
+    const available = poolAvailable18();
+    if (available <= 0n) {
+      console.log("[pool_mint_wwart] no pool capacity — deposit WART to pool first");
+      return "reject";
+    }
+    const mintAmt = requested > available ? available : requested;
+    const pu = ensurePoolUser(user);
+    const vault = ensureUserVaultShell(user);
+
+    fungiblePool.claimed18 += mintAmt;
+    pu.claim18 += mintAmt;
+    pu.portable18 += mintAmt;
+    vault.poolL1WwartClaim = (vault.poolL1WwartClaim || 0n) + mintAmt;
+    vault.poolWwartPortable = (vault.poolWwartPortable || 0n) + mintAmt;
+    userVaults.set(user, vault);
+
+    // Keep `user` as address string (do not spread poolSnapshot over it — FE matches owner).
+    const snap = poolSnapshot(user);
+    await sendNotice(
+      stringToHex(
+        JSON.stringify({
+          type: "pool_wwart_minted",
+          token: "wWART",
+          tokenAddress: WWART_ADDRESS,
+          user,
+          owner: user,
+          amount: mintAmt.toString(),
+          amountE8: (mintAmt / 10n ** 10n).toString(),
+          source: "pool",
+          poolL1WwartClaim: vault.poolL1WwartClaim.toString(),
+          poolWwartPortable: vault.poolWwartPortable.toString(),
+          pool: snap,
+          lockedE8: snap.lockedE8,
+          claimed18: snap.claimed18,
+          available18: snap.available18,
+          message:
+            "Path A pool claim minted. Withdraw via pool_withdraw_wwart (L1 mint voucher). Not personal vault capacity.",
+        }),
+      ),
+    );
+    console.log(`[pool_mint_wwart] ${user} +${mintAmt} pool claim`);
+    return "accept";
+  }
+
+  /**
+   * pool_withdraw_wwart — L1 mint voucher for pool portable claims.
+   * Capacity stays used until pool_burn_wwart.
+   */
+  if (input?.type === "pool_withdraw_wwart") {
+    const user = sender;
+    let amount;
+    try {
+      amount = parseHumanTo18(input.amount, "0");
+    } catch {
+      return "reject";
+    }
+    if (amount <= 0n) return "reject";
+    if (!WWART_ADDRESS || WWART_ADDRESS === "0x0000000000000000000000000000000000000000") {
+      return "reject";
+    }
+    const vault = ensureUserVaultShell(user);
+    const portable = vault.poolWwartPortable || 0n;
+    if (portable < amount) {
+      console.log(
+        `[pool_withdraw_wwart] insufficient portable have=${portable} need=${amount}`,
+      );
+      return "reject";
+    }
+    vault.poolWwartPortable = portable - amount;
+    // claim stays (filled on L1)
+    userVaults.set(user, vault);
+    const pu = ensurePoolUser(user);
+    if (pu.portable18 >= amount) pu.portable18 -= amount;
+    else pu.portable18 = 0n;
+
+    try {
+      await ERC20.emitVoucher(
+        WWART_ADDRESS,
+        ERC20.buildMintPayload(user, amount),
+      );
+      await sendNotice(
+        stringToHex(
+          JSON.stringify({
+            type: "pool_wwart_withdrawn",
+            user,
+            amount: amount.toString(),
+            tokenAddress: WWART_ADDRESS,
+            source: "pool",
+            poolL1WwartClaim: (vault.poolL1WwartClaim || 0n).toString(),
+            poolWwartPortable: (vault.poolWwartPortable || 0n).toString(),
+            message:
+              "L1 mint voucher for pool claim — execute voucher for MetaMask wWART. Capacity still used until burn.",
+          }),
+        ),
+      );
+      console.log(`[pool_withdraw_wwart] ${user} mint voucher ${amount}`);
+      return "accept";
+    } catch (e) {
+      vault.poolWwartPortable = portable;
+      userVaults.set(user, vault);
+      pu.portable18 += amount;
+      console.error("[pool_withdraw_wwart] voucher failed", e.message);
+      return "reject";
+    }
+  }
+
+  /**
+   * pool_burn_wwart — free pool capacity.
+   * A-α: minter path — burn open portable and/or own filled claim (portal inventory).
+   * A-β: holder path — any L1 owner with pool-portal wWART may burn against *global*
+   *       claimed capacity (true fungible peg); auto-unlock pays redeemer (FIFO deposits).
+   * Does NOT consume Path B personal portal (vault.wWART) — paths stay isolated.
+   */
+  if (input?.type === "pool_burn_wwart") {
+    const user = sender;
+    let amount;
+    try {
+      amount = parseHumanTo18(input.amount, "0");
+    } catch {
+      return "reject";
+    }
+    if (amount <= 0n) return "reject";
+    const vault = ensureUserVaultShell(user);
+    const claim = vault.poolL1WwartClaim || 0n;
+    const portable = vault.poolWwartPortable || 0n;
+    const portal = portalWwart18Of(vault.poolPortalWwart);
+    const personalPortal = portalWwart18Of(vault.wWART);
+    const globalClaim = fungiblePool.claimed18;
+    const autoUnlock = input.autoUnlock !== false && input.autoUnlock !== 0;
+    const toAddress = input.toAddress || null;
+
+    // ── A-β holder burn: no personal claim required; portal + global claimed ──
+    const isHolderBurn =
+      claim < amount && portal >= amount && globalClaim >= amount;
+
+    if (isHolderBurn) {
+      vault.poolPortalWwart = portal - amount;
+      userVaults.set(user, vault);
+      fungiblePool.claimed18 = globalClaim - amount;
+      const claimDebits = debitFilledClaimsFifo(amount, user);
+
+      let unlockTicket = null;
+      if (autoUnlock) {
+        const burnE8 = amount / 10n ** 10n;
+        if (burnE8 > 0n) {
+          try {
+            unlockTicket = await issuePoolReleaseTicket({
+              user,
+              amtE8: burnE8,
+              amount18: amount,
+              toAddress,
+              reason: "holder-burn-unlock",
+            });
+            console.log(
+              `[pool_burn_wwart] A-β holder unlock ${user} e8=${burnE8} ticket=${unlockTicket.ticketId}`,
+            );
+          } catch (e) {
+            console.error(
+              "[pool_burn_wwart] A-β auto-unlock failed:",
+              e?.message || e,
+            );
+          }
+        }
+      }
+
+      await sendNotice(
+        stringToHex(
+          JSON.stringify({
+            type: "pool_wwart_burned",
+            token: "wWART",
+            tokenAddress: WWART_ADDRESS,
+            user,
+            amount: amount.toString(),
+            source: "pool",
+            phase: "A-beta",
+            reason: "holder-burn",
+            claimDebits,
+            poolL1WwartClaim: (vault.poolL1WwartClaim || 0n).toString(),
+            poolWwartPortable: (vault.poolWwartPortable || 0n).toString(),
+            poolPortalWwart: (vault.poolPortalWwart || 0n).toString(),
+            unlockTicketId: unlockTicket?.ticketId || null,
+            unlockAmountE8: unlockTicket?.amountE8 || null,
+            toAddress: unlockTicket?.toAddress || toAddress || null,
+            ...poolSnapshot(user),
+            message: unlockTicket
+              ? "A-β holder burn — release ticket issued; hot wallet pays WART to redeem-to"
+              : "A-β holder burn — pool Available ↑. Set redeem-to and re-burn with autoUnlock or use Redeem.",
+          }),
+        ),
+      );
+      console.log(`[pool_burn_wwart] A-β holder ${user} -${amount}`);
+      return "accept";
+    }
+
+    // ── A-α minter / same-owner burn ──
+    const coverable = portable + portal;
+    const burnable = claim < coverable ? claim : coverable;
+    if (claim < amount) {
+      console.log(
+        `[pool_burn_wwart] insufficient claim ${claim} < ${amount} (holder needs portal+global claimed)`,
+      );
+      await sendNotice(
+        stringToHex(
+          JSON.stringify({
+            type: "pool_wwart_burn_rejected",
+            user,
+            amount: amount.toString(),
+            claim: claim.toString(),
+            poolPortalWwart: portal.toString(),
+            globalClaimed18: globalClaim.toString(),
+            message:
+              portal < amount
+                ? "Deposit L1 wWART via portal (Path A) before burning. Holders: any open pool claim on the peg backs your burn."
+                : "No open pool claims to redeem against (global claimed insufficient).",
+          }),
+        ),
+      );
+      return "reject";
+    }
+    if (amount > burnable) {
+      console.log(
+        `[pool_burn_wwart] need pool portal deposit burnable=${burnable} poolPortal=${portal} personalPortal=${personalPortal} (personal cannot cover pool)`,
+      );
+      await sendNotice(
+        stringToHex(
+          JSON.stringify({
+            type: "pool_wwart_burn_rejected",
+            user,
+            amount: amount.toString(),
+            burnable: burnable.toString(),
+            poolPortalWwart: portal.toString(),
+            personalPortalWwart: personalPortal.toString(),
+            message:
+              personalPortal > 0n && portal === 0n
+                ? "Path B personal portal wWART cannot cover a Path A pool burn. Deposit again while a pool filled claim is open (auto-routes to pool portal), or burn open portable only."
+                : "Deposit L1 wWART back via portal for Path A (pool portal) before burning filled pool claims (or burn open portable only).",
+          }),
+        ),
+      );
+      return "reject";
+    }
+
+    vault.poolL1WwartClaim = claim - amount;
+    let invLeft = amount;
+    if (portable > 0n && invLeft > 0n) {
+      const d = portable >= invLeft ? invLeft : portable;
+      vault.poolWwartPortable = portable - d;
+      invLeft -= d;
+    }
+    if (portal > 0n && invLeft > 0n) {
+      const d = portal >= invLeft ? invLeft : portal;
+      vault.poolPortalWwart = portal - d;
+      invLeft -= d;
+    }
+    if (invLeft > 0n) {
+      vault.poolL1WwartClaim = claim;
+      vault.poolWwartPortable = portable;
+      vault.poolPortalWwart = portal;
+      return "reject";
+    }
+    userVaults.set(user, vault);
+
+    const g = fungiblePool.claimed18;
+    fungiblePool.claimed18 = g > amount ? g - amount : 0n;
+    const pu = ensurePoolUser(user);
+    pu.claim18 = pu.claim18 > amount ? pu.claim18 - amount : 0n;
+    if (pu.portable18 > (vault.poolWwartPortable || 0n)) {
+      pu.portable18 = vault.poolWwartPortable || 0n;
+    }
+
+    // Auto-unlock free headroom created by this burn (filled reverse path).
+    // opt-out: autoUnlock: false
+    let unlockTicket = null;
+    if (autoUnlock) {
+      const burnE8 = amount / 10n ** 10n;
+      const freeable = userFreeableE8(user);
+      const unlockE8 = burnE8 < freeable ? burnE8 : freeable;
+      if (unlockE8 > 0n) {
+        try {
+          unlockTicket = await issuePoolReleaseTicket({
+            user,
+            amtE8: unlockE8,
+            amount18: unlockE8 * 10n ** 10n,
+            toAddress,
+            reason: "burn-auto-unlock",
+          });
+          console.log(
+            `[pool_burn_wwart] auto-unlock ${user} e8=${unlockE8} ticket=${unlockTicket.ticketId}`,
+          );
+        } catch (e) {
+          console.error(
+            "[pool_burn_wwart] auto-unlock failed:",
+            e?.message || e,
+          );
+        }
+      }
+    }
+
+    await sendNotice(
+      stringToHex(
+        JSON.stringify({
+          type: "pool_wwart_burned",
+          token: "wWART",
+          tokenAddress: WWART_ADDRESS,
+          user,
+          amount: amount.toString(),
+          source: "pool",
+          phase: "A-alpha",
+          reason: "owner-burn",
+          poolL1WwartClaim: vault.poolL1WwartClaim.toString(),
+          poolWwartPortable: (vault.poolWwartPortable || 0n).toString(),
+          poolPortalWwart: (vault.poolPortalWwart || 0n).toString(),
+          unlockTicketId: unlockTicket?.ticketId || null,
+          unlockAmountE8: unlockTicket?.amountE8 || null,
+          toAddress: unlockTicket?.toAddress || toAddress || null,
+          ...poolSnapshot(user),
+          message: unlockTicket
+            ? "Pool claim burned + free deposit unlocked — execute payout for release ticket"
+            : "Pool claim burned — pool Available ↑. Redeem freeable deposit to unlock native WART.",
+        }),
+      ),
+    );
+    console.log(`[pool_burn_wwart] ${user} -${amount}`);
+    return "accept";
+  }
+
+  /**
+   * pool_unlock — pay out free headroom deposit (no open claim required).
+   * Use after burn of filled claims when locked deposit remains, or anytime
+   * user.depositedE8 and global freeable allow.
+   */
+  if (input?.type === "pool_unlock") {
+    const user = sender;
+    let amount;
+    try {
+      // Prefer explicit amountE8; else human WART → 18-dec → E8
+      if (input.amountE8 != null && String(input.amountE8).trim() !== "") {
+        amount = BigInt(String(input.amountE8)) * 10n ** 10n;
+      } else {
+        amount = parseHumanTo18(input.amount, "0");
+      }
+    } catch {
+      return "reject";
+    }
+    if (amount <= 0n) return "reject";
+    const amtE8 = amount / 10n ** 10n;
+    if (amtE8 <= 0n) {
+      console.log("[pool_unlock] amount too small for E8");
+      await sendNotice(
+        stringToHex(
+          JSON.stringify({
+            type: "pool_unlock_rejected",
+            user,
+            reason: "amount too small",
+            message: "Unlock amount must be ≥ 1e-8 WART",
+          }),
+        ),
+      );
+      return "reject";
+    }
+    const freeable = userFreeableE8(user);
+    if (freeable < amtE8) {
+      console.log(
+        `[pool_unlock] insufficient freeable freeable=${freeable} need=${amtE8} claim still open?`,
+      );
+      await sendNotice(
+        stringToHex(
+          JSON.stringify({
+            type: "pool_unlock_rejected",
+            user,
+            reason: "insufficient freeable",
+            freeableE8: freeable.toString(),
+            requestedE8: amtE8.toString(),
+            ...poolSnapshot(user),
+            message:
+              freeable === 0n
+                ? "No freeable deposit — burn open/filled claims first (deposit MetaMask wWART if filled), or deposit WART with no open claim."
+                : `Only ${freeable} E8 freeable (burn more claims or reduce amount).`,
+          }),
+        ),
+      );
+      return "reject";
+    }
+    let ticket;
+    try {
+      ticket = await issuePoolReleaseTicket({
+        user,
+        amtE8,
+        amount18: amount,
+        toAddress: input.toAddress || null,
+        reason: "free-deposit-unlock",
+      });
+    } catch (e) {
+      console.error("[pool_unlock] failed:", e?.message || e);
+      return "reject";
+    }
+    await sendNotice(
+      stringToHex(
+        JSON.stringify({
+          type: "pool_unlocked",
+          user,
+          ticketId: ticket.ticketId,
+          amountE8: amtE8.toString(),
+          amount18: amount.toString(),
+          toAddress: ticket.toAddress,
+          source: "pool",
+          reason: "free-deposit-unlock",
+          ...poolSnapshot(user),
+        }),
+      ),
+    );
+    console.log(`[pool_unlock] ${user} ticket ${ticket.ticketId} amtE8=${amtE8}`);
+    return "accept";
+  }
+
+  /**
+   * pool_redeem — A-α:
+   *  (1) Open portable claim → burn claim + unlock locked WART + ticket
+   *  (2) Else free-deposit unlock (post-burn stranded deposit) → ticket only
+   * Does not use cosigner. Actual Warthog transfer is ops/hot-wallet off-chain.
+   */
+  if (input?.type === "pool_redeem") {
+    const user = sender;
+    let amount;
+    try {
+      amount = parseHumanTo18(input.amount, "0");
+    } catch {
+      return "reject";
+    }
+    if (amount <= 0n) return "reject";
+    // 18-dec → E8 (truncate)
+    const amtE8 = amount / 10n ** 10n;
+    if (amtE8 <= 0n) {
+      console.log("[pool_redeem] amount too small for E8");
+      return "reject";
+    }
+    const vault = ensureUserVaultShell(user);
+    const claim = vault.poolL1WwartClaim || 0n;
+    const portable = vault.poolWwartPortable || 0n;
+    const toAddress =
+      String(input.toAddress || "").replace(/^0x/i, "").toLowerCase() || null;
+
+    // Path 1: open portable redeem (mint claim still on rollup)
+    if (portable >= amount && claim >= amount) {
+      if (fungiblePool.lockedE8 < amtE8) {
+        console.log("[pool_redeem] pool locked insufficient");
+        await sendNotice(
+          stringToHex(
+            JSON.stringify({
+              type: "pool_redeem_rejected",
+              user,
+              reason: "insufficient locked",
+              message: "Pool locked WART insufficient for redeem",
+            }),
+          ),
+        );
+        return "reject";
+      }
+
+      vault.poolL1WwartClaim = claim - amount;
+      vault.poolWwartPortable = portable - amount;
+      userVaults.set(user, vault);
+
+      fungiblePool.claimed18 =
+        fungiblePool.claimed18 > amount ? fungiblePool.claimed18 - amount : 0n;
+      const pu = ensurePoolUser(user);
+      pu.claim18 = pu.claim18 > amount ? pu.claim18 - amount : 0n;
+      pu.portable18 = pu.portable18 > amount ? pu.portable18 - amount : 0n;
+
+      let ticket;
+      try {
+        ticket = await issuePoolReleaseTicket({
+          user,
+          amtE8,
+          amount18: amount,
+          toAddress,
+          reason: "portable-redeem",
+        });
+      } catch (e) {
+        // roll back claim burn if ticket fails
+        vault.poolL1WwartClaim = claim;
+        vault.poolWwartPortable = portable;
+        userVaults.set(user, vault);
+        fungiblePool.claimed18 += amount;
+        pu.claim18 += amount;
+        pu.portable18 += amount;
+        console.error("[pool_redeem] ticket failed:", e?.message || e);
+        return "reject";
+      }
+
+      await sendNotice(
+        stringToHex(
+          JSON.stringify({
+            type: "pool_redeemed",
+            user,
+            ticketId: ticket.ticketId,
+            amountE8: amtE8.toString(),
+            amount18: amount.toString(),
+            toAddress,
+            source: "pool",
+            reason: "portable-redeem",
+            ...poolSnapshot(user),
+          }),
+        ),
+      );
+      console.log(
+        `[pool_redeem] portable ${user} ticket ${ticket.ticketId} amtE8=${amtE8}`,
+      );
+      return "accept";
+    }
+
+    // Path 2: free-deposit unlock (claim already burned / no portable)
+    const freeable = userFreeableE8(user);
+    if (freeable >= amtE8) {
+      let ticket;
+      try {
+        ticket = await issuePoolReleaseTicket({
+          user,
+          amtE8,
+          amount18: amount,
+          toAddress,
+          reason: "free-deposit-unlock",
+        });
+      } catch (e) {
+        console.error("[pool_redeem] unlock failed:", e?.message || e);
+        return "reject";
+      }
+      await sendNotice(
+        stringToHex(
+          JSON.stringify({
+            type: "pool_redeemed",
+            user,
+            ticketId: ticket.ticketId,
+            amountE8: amtE8.toString(),
+            amount18: amount.toString(),
+            toAddress,
+            source: "pool",
+            reason: "free-deposit-unlock",
+            ...poolSnapshot(user),
+            message:
+              "Redeemed freeable deposit (no open portable claim) — hot wallet payout",
+          }),
+        ),
+      );
+      console.log(
+        `[pool_redeem] free-unlock ${user} ticket ${ticket.ticketId} amtE8=${amtE8}`,
+      );
+      return "accept";
+    }
+
+    console.log(
+      `[pool_redeem] reject portable=${portable} claim=${claim} freeable=${freeable} amt=${amount}`,
+    );
+    await sendNotice(
+      stringToHex(
+        JSON.stringify({
+          type: "pool_redeem_rejected",
+          user,
+          reason: "no portable and insufficient freeable",
+          portable: portable.toString(),
+          claim: claim.toString(),
+          freeableE8: freeable.toString(),
+          requestedE8: amtE8.toString(),
+          ...poolSnapshot(user),
+          message:
+            freeable === 0n && claim > 0n
+              ? "Filled claim still open — deposit MetaMask wWART via portal, then Burn claim (auto-unlocks) or burn then Redeem freeable."
+              : freeable === 0n
+                ? "Nothing to redeem — no open portable claim and no freeable deposit."
+                : `Only ${Number(freeable) / 1e8} WART freeable — reduce amount or burn more claims first.`,
+        }),
+      ),
+    );
+    return "reject";
   }
 
   // PERSONAL VAULT — register spendable Warthog vault (client-derived address preferred)
@@ -2215,6 +3588,20 @@ const handleInspect = async (rawPayload) => {
     return "accept";
   }
 
+  // Path A pool inspect: pool / pool/wart-pool-0 / pool/<ownerEth>
+  const pathLower = path.toLowerCase().replace(/^\/+/, "");
+  if (pathLower === "pool" || pathLower.startsWith("pool/")) {
+    const rest = pathLower === "pool" ? "" : pathLower.slice(5);
+    let owner = null;
+    if (rest && rest !== fungiblePool.poolId && rest !== "wart-pool-0") {
+      owner = rest.startsWith("0x") ? rest : "0x" + rest;
+    }
+    const snap = poolSnapshot(owner);
+    await sendReport(stringToHex(JSON.stringify({ ok: true, ...snap })));
+    console.log("POOL INSPECT SENT", owner || "global");
+    return "accept";
+  }
+
   if (path.toLowerCase().includes("vault")) {
     console.log("VAULT INSPECT DETECTED - DECODED PATH:", path);
 
@@ -2309,19 +3696,27 @@ const handleInspect = async (rawPayload) => {
     const claimed18 = (vault.liquid || 0n) + (vault.l1WwartClaim || 0n);
     const remaining18 = capacity18 > claimed18 ? capacity18 - claimed18 : 0n;
 
-    // Portal wWART is 18-dec. Legacy sweeps wrote spoofed E8 into wWART — hide that pollution.
-    const rawWwart = vault.wWART || 0n;
-    const portalWwartReport =
-      rawWwart > 0n && rawWwart < 10n ** 15n ? 0n : rawWwart;
+    // Path B personal portal wWART (18-dec). Legacy E8 pollution hidden.
+    const portalWwartReport = portalWwart18Of(vault.wWART);
+    // Path A pool portal — isolated; cannot cover personal burns and vice versa.
+    const poolPortalReport = portalWwart18Of(vault.poolPortalWwart);
 
     // Open = still portable (not withdrawn); filled = claim held while ERC-20 is on L1.
-    // Burnable capacity free = min(claim, portable + portal returned inventory).
+    // Burnable = min(claim, portable + same-path portal inventory).
     const claimR = vault.l1WwartClaim || 0n;
     const portableR = vault.wwartPortable || 0n;
     const openClaimR = portableR < claimR ? portableR : claimR;
     const filledClaimR = claimR > openClaimR ? claimR - openClaimR : 0n;
     const coverableR = portableR + portalWwartReport;
     const burnableR = claimR < coverableR ? claimR : coverableR;
+
+    const poolClaimR = vault.poolL1WwartClaim || 0n;
+    const poolPortableR = vault.poolWwartPortable || 0n;
+    const poolOpenR = poolPortableR < poolClaimR ? poolPortableR : poolClaimR;
+    const poolFilledR = poolClaimR > poolOpenR ? poolClaimR - poolOpenR : 0n;
+    const poolCoverableR = poolPortableR + poolPortalReport;
+    const poolBurnableR =
+      poolClaimR < poolCoverableR ? poolClaimR : poolCoverableR;
 
     const isRegistered =
       registeredUsers.get(address) === true ||
@@ -2330,6 +3725,7 @@ const handleInspect = async (rawPayload) => {
 
     const reportPayload = stringToHex(JSON.stringify({
       liquid: vault.liquid.toString(),
+      /** Path B personal portal inventory only */
       wWART: portalWwartReport.toString(),
       wwartPortable: (vault.wwartPortable || 0n).toString(),
       l1WwartClaim: (vault.l1WwartClaim || 0n).toString(),
@@ -2337,6 +3733,11 @@ const handleInspect = async (rawPayload) => {
       wwartOpenClaim: openClaimR.toString(),
       wwartFilledClaim: filledClaimR.toString(),
       wwartBurnable: burnableR.toString(),
+      /** Path A pool portal inventory (isolated from wWART personal portal) */
+      poolPortalWwart: poolPortalReport.toString(),
+      poolWwartOpenClaim: poolOpenR.toString(),
+      poolWwartFilledClaim: poolFilledR.toString(),
+      poolWwartBurnable: poolBurnableR.toString(),
       CTSI: vault.CTSI.toString(),
       usdc: vault.usdc.toString(),
       eth: formatEther(vault.eth),
@@ -2397,6 +3798,10 @@ const handleInspect = async (rawPayload) => {
       })(),
       l1WethClaim: (vault.l1WethClaim || 0n).toString(),
       wethPortable: (vault.wethPortable || 0n).toString(),
+      /** Native Warthog ETH assets linked to claims (newest last) */
+      ethWartAssets: Array.isArray(vault.ethWartAssets)
+        ? vault.ethWartAssets.slice().reverse()
+        : [],
       /** true once this L1 owner has submitted register_address */
       registered: isRegistered,
       spoofedMintHistory: mintHistory.map(m => ({...m, amount: m.amount.toString()})),
@@ -2408,6 +3813,12 @@ const handleInspect = async (rawPayload) => {
       mintCapacity18: capacity18.toString(),
       mintClaimed18: claimed18.toString(),
       mintRemaining18: remaining18.toString(),
+      /** Path A pool claims (not personal vault capacity) */
+      poolL1WwartClaim: (vault.poolL1WwartClaim || 0n).toString(),
+      poolWwartPortable: (vault.poolWwartPortable || 0n).toString(),
+      /** Alias for clarity in clients */
+      poolPortalInventory: poolPortalReport.toString(),
+      fungiblePool: poolSnapshot(address),
       releaseTickets: releaseSummary,
       personalVault: personal ? {
         vaultAddress: personal.vaultAddress,

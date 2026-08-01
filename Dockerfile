@@ -1,7 +1,7 @@
 # syntax=docker.io/docker/dockerfile:1
 
 # ────────────────────────────────────────────────────────────────
-# STAGE 1: Build Rust zk-proof-generator binary on HOST platform
+# STAGE 1: Build Rust zk-proof-generator + JanusHash checker (riscv64)
 # ────────────────────────────────────────────────────────────────
 FROM rustlang/rust:nightly AS rust-build
 
@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     gcc-riscv64-linux-gnu \
     g++-riscv64-linux-gnu \
     binutils-riscv64-linux-gnu \
+    make \
     && rm -rf /var/lib/apt/lists/*
 
 # Add riscv64 target
@@ -25,6 +26,17 @@ RUN cargo build --release --target riscv64gc-unknown-linux-gnu --bin zk-proof-ge
 
 # Extract the final binary
 RUN mv target/riscv64gc-unknown-linux-gnu/release/zk-proof-generator /zk-proof-generator
+
+# JanusHash / VerusHash v2.2 checker (portable soft-SIMD for RISC-V)
+# Static link so Cartesi jammy (older glibc) can run the binary.
+WORKDIR /usr/src/janushash
+COPY native/janushash/ ./
+RUN make clean \
+  && make -j"$(nproc)" TARGET=riscv64 \
+       LDFLAGS="-static -static-libgcc -static-libstdc++" \
+  && cp janushash-check /janushash-check \
+  && riscv64-linux-gnu-strip /janushash-check || true \
+  && file /janushash-check || true
 
 # ────────────────────────────────────────────────────────────────
 # STAGE 2: Build JavaScript part (your existing dApp logic)
@@ -79,7 +91,13 @@ COPY --from=js-build /opt/cartesi/dapp/dist .
 COPY --from=rust-build /zk-proof-generator /opt/cartesi/bin/zk-proof-generator
 RUN chmod +x /opt/cartesi/bin/zk-proof-generator
 
+# Janus8 PoW checker (VerusHash v2.2 × SHA256t)
+COPY --from=rust-build /janushash-check /opt/cartesi/bin/janushash-check
+RUN chmod +x /opt/cartesi/bin/janushash-check
+
 ENV ROLLUP_HTTP_SERVER_URL="http://127.0.0.1:5004"
+ENV JANUSHASH_CHECK=/opt/cartesi/bin/janushash-check
+ENV WART_SPV_REQUIRE_POW=1
 
 ENTRYPOINT ["rollup-init"]
 CMD ["node", "index.js"]
