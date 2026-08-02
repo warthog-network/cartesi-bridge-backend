@@ -19,12 +19,14 @@ const {
 /** Phase 3 Warthog light client (headers + SPV deposits). */
 const wartLc = createLightClient({
   poolAccountId: Number(process.env.FUNGIBLE_POOL_ACCOUNT_ID || 81),
-  minConfirmations: Number(process.env.WART_SPV_MIN_CONF || 1),
+  minConfirmations: Number(process.env.WART_SPV_MIN_CONF || 2),
   allowBootstrap: process.env.WART_SPV_ALLOW_BOOTSTRAP !== "0",
   maxHeaders: Number(process.env.WART_SPV_MAX_HEADERS || 512),
 });
 /** When 1, naked pool_deposit (host JSON) is rejected — SPV only. Default 0 for lab. */
 const POOL_REQUIRE_SPV = process.env.POOL_REQUIRE_SPV === "1";
+/** Allow re-bootstrap after LC already live (default off — harden). */
+const WART_SPV_ALLOW_REBOOTSTRAP = process.env.WART_SPV_ALLOW_REBOOTSTRAP === "1";
 // cartesi-wallet internal balance map (optional helper paths)
 const wallet = new Wallet(new Map());
 
@@ -171,8 +173,49 @@ const fungiblePool = {
   users: new Map(),
   /** credited Warthog tx hashes */
   usedDepositTxs: new Set(),
+  /**
+   * First-writer-wins bindings so deposit credit cannot be stolen:
+   * originAccountId (string) → L1 owner
+   * wartFromAddress (hex lower) → L1 owner
+   */
+  ownerByOriginAccountId: new Map(),
+  ownerByWartAddress: new Map(),
   tickets: [],
 };
+
+/**
+ * Bind Warthog origin to L1 owner (first credit wins).
+ * @throws if already bound to a different owner
+ */
+function assertAndBindDepositOwner(owner, { originAccountId = null, fromAddress = null } = {}) {
+  const o = String(owner || "").toLowerCase();
+  if (!o.startsWith("0x") || o.length !== 42) {
+    throw new Error("deposit owner must be 0x + 40 hex L1 address");
+  }
+  if (originAccountId != null && Number.isFinite(Number(originAccountId))) {
+    const key = String(Number(originAccountId));
+    const prev = fungiblePool.ownerByOriginAccountId.get(key);
+    if (prev && prev !== o) {
+      throw new Error(
+        `originAccountId ${key} already bound to ${prev} (not ${o})`,
+      );
+    }
+    if (!prev) fungiblePool.ownerByOriginAccountId.set(key, o);
+  }
+  if (fromAddress) {
+    const f = String(fromAddress).replace(/^0x/i, "").toLowerCase();
+    if (f.length >= 40) {
+      const prev = fungiblePool.ownerByWartAddress.get(f);
+      if (prev && prev !== o) {
+        throw new Error(
+          `Warthog ${f.slice(0, 12)}… already bound to ${prev} (not ${o})`,
+        );
+      }
+      if (!prev) fungiblePool.ownerByWartAddress.set(f, o);
+    }
+  }
+  return o;
+}
 console.log(
   "[fungible-pool] Path A pool address:",
   fungiblePool.poolAddress,
@@ -1011,6 +1054,11 @@ const handleAdvance = async (request) => {
   if (isWartSpvInput(input)) {
     try {
       if (input.type === "wart_checkpoint" || (input.type === "wart_headers" && input.bootstrap)) {
+        if (wartLc.bootstrapped && !WART_SPV_ALLOW_REBOOTSTRAP) {
+          throw new Error(
+            "light client already bootstrapped — re-bootstrap disabled (set WART_SPV_ALLOW_REBOOTSTRAP=1)",
+          );
+        }
         const headers = input.headers || (input.header ? [input.header] : []);
         if (!headers.length && input.checkpointHash) {
           // Minimal checkpoint without full window
@@ -1066,12 +1114,17 @@ const handleAdvance = async (request) => {
       }
 
       if (input.type === "wart_deposit_claim") {
-        const owner = String(input.owner || sender || "").toLowerCase();
+        let owner = String(input.owner || sender || "").toLowerCase();
         if (!owner.startsWith("0x") || owner.length !== 42) {
           throw new Error("wart_deposit_claim requires owner L1 address");
         }
         const credit = verifyDepositClaim(input, wartLc, {
           poolAccountId: wartLc.poolAccountId,
+        });
+        // Bind originAccountId → owner (first credit wins; rejects steal)
+        owner = assertAndBindDepositOwner(owner, {
+          originAccountId: credit.originAccountId,
+          fromAddress: input.fromAddress || input.tx?.fromAddress || null,
         });
         const txKey = credit.txKey;
         if (fungiblePool.usedDepositTxs.has(txKey)) {
@@ -2299,7 +2352,7 @@ const handleAdvance = async (request) => {
       }
       return "reject";
     }
-    const owner = String(input.owner || sender).toLowerCase();
+    let owner = String(input.owner || sender).toLowerCase();
     const proof = input.depositProof || input.proof || input.sweepProof;
     const tx = normalizeWarthogTx(proof);
 
@@ -2350,6 +2403,14 @@ const handleAdvance = async (request) => {
     const amtE8 = BigInt(String(tx.amountE8));
     if (amtE8 <= 0n) {
       return await rejectDeposit("amount must be > 0", { amountE8: "0" });
+    }
+
+    try {
+      owner = assertAndBindDepositOwner(owner, {
+        fromAddress: tx.fromAddress || null,
+      });
+    } catch (e) {
+      return await rejectDeposit(e?.message || String(e), { txHash });
     }
 
     if (txHash) fungiblePool.usedDepositTxs.add(txHash);
